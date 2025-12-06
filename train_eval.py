@@ -11,6 +11,7 @@ CCP系统训练与评估脚本
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
@@ -130,22 +131,35 @@ class Trainer:
     """
     CCP系统训练器
     """
-    
+
     def __init__(
         self,
         model: CCPSystem,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
         lr: float = 1e-3,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        student_model: Optional[nn.Module] = None,
+        distill_weight: float = 0.3,
+        distill_temperature: float = 2.0,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
-        
+        self.student_model = student_model.to(device) if student_model is not None else None
+        self.distill_weight = distill_weight
+        self.distill_temperature = distill_temperature
+
         # 优化器
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+
+        if self.student_model is not None:
+            self.student_optimizer = optim.AdamW(
+                self.student_model.parameters(), lr=lr, weight_decay=0.01
+            )
+        else:
+            self.student_optimizer = None
         
         # 学习率调度器
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -200,7 +214,19 @@ class Trainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
-            
+
+            # 蒸馏轻量化学生模型，便于边缘侧部署
+            if self.student_model is not None and self.student_optimizer is not None:
+                self.student_optimizer.zero_grad()
+                with torch.no_grad():
+                    teacher_target = outputs['predictions'].detach()
+                student_pred = self.student_model(x)
+                distill_loss = F.mse_loss(student_pred, teacher_target)
+                (self.distill_weight * distill_loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
+                self.student_optimizer.step()
+                loss_dict['distill'] = float(distill_loss.detach())
+
             total_loss += loss_dict['total']
             total_data_loss += loss_dict['data']
             total_physics_loss += loss_dict['physics']

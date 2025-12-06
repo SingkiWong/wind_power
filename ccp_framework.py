@@ -57,11 +57,17 @@ class CCPConfig:
     curriculum_start_physics: int = 3  # 物理损失开始参与的epoch
     curriculum_start_causal: int = 5   # 因果损失开始参与的epoch
     curriculum_warmup_epochs: int = 3  # 从起始到完全权重的线性升温周期
-    
+    residual_weight: float = 0.2       # 物理残差正则权重
+
     # 架构选择
-    backbone: str = "mamba"       # 骨干网络: "mamba", "transformer", "ttm"
+    backbone: str = "mamba"       # 骨干网络: "mamba", "mamba_kan", "transformer", "ttm"
     use_kan: bool = True          # 是否使用KAN增强
+    kan_usage: str = "selective"  # "full" 对所有时间步用KAN, "selective" 只对关键步
+    kan_focus_steps: int = 4       # 使用KAN精修的末尾时间步数量
     use_physics_attention: bool = True  # 是否使用物理引导注意力
+
+    # 因果图更新节奏
+    causal_refresh_minutes: int = 15   # 离线尾流图更新间隔
 
 
 class PhysicalPerceptionLayer(nn.Module):
@@ -92,6 +98,17 @@ class PhysicalPerceptionLayer(nn.Module):
                 d_model=config.d_model,
                 n_layers=config.n_layers,
                 use_flow_attention=config.use_physics_attention
+            )
+        elif config.backbone == "mamba_kan":
+            # 混合架构：长序列特征由Mamba完成，KAN仅在输出头精修，降低总体FLOPs
+            self.backbone = MambaKANHybrid(
+                input_len=config.input_len,
+                output_len=config.output_len,
+                num_features=config.d_model,
+                d_model=config.d_model,
+                n_mamba_layers=max(1, config.n_layers - 1),
+                kan_hidden=32,
+                num_knots=6
             )
         elif config.backbone == "transformer":
             self.backbone = PhysicsInformedTransformer(
@@ -124,19 +141,21 @@ class PhysicalPerceptionLayer(nn.Module):
             self.physics_attention = None
         
         # KAN增强层（可选）
+        self.linear_head = nn.Linear(config.d_model, config.num_features)
         if config.use_kan:
             self.kan_head = KAN(
                 [config.d_model, 32, config.num_features],
-                num_knots=8
+                num_knots=6 if config.kan_usage == "selective" else 8
             )
         else:
-            self.kan_head = nn.Linear(config.d_model, config.num_features)
+            self.kan_head = self.linear_head
         
         # 物理损失计算
         self.physics_loss = PhysicsLoss(
             rated_power=config.rated_power,
             cut_in_speed=config.cut_in_speed,
-            cut_out_speed=config.cut_out_speed
+            cut_out_speed=config.cut_out_speed,
+            residual_weight=config.residual_weight
         )
     
     def forward(
@@ -175,15 +194,22 @@ class PhysicalPerceptionLayer(nn.Module):
                 )
                 backbone_out = backbone_out + attn_out
         
-        # KAN输出头
-        if isinstance(self.kan_head, KAN):
-            # KAN需要展平处理
+        # KAN输出头（可选局部精修以降低开销）
+        if isinstance(self.kan_head, KAN) and self.config.kan_usage == "selective":
+            b, t, d = backbone_out.shape
+            focus = min(self.config.kan_focus_steps, t)
+            fast_path = self.linear_head(backbone_out)
+            flat = backbone_out[:, -focus:, :].reshape(-1, d)
+            refined_flat = self.kan_head(flat)
+            fast_path[:, -focus:, :] = refined_flat.reshape(b, focus, -1)
+            output = fast_path
+        elif isinstance(self.kan_head, KAN):
             b, t, d = backbone_out.shape
             flat = backbone_out.reshape(-1, d)
             out_flat = self.kan_head(flat)
             output = out_flat.reshape(b, t, -1)
         else:
-            output = self.kan_head(backbone_out)
+            output = self.linear_head(backbone_out)
         
         return output, attention_weights
 
@@ -224,20 +250,40 @@ class CausalReasoningLayer(nn.Module):
         self.causal_bias = nn.Parameter(
             torch.zeros(config.num_turbines, config.num_turbines)
         )
+
+        # 离线-在线分离：缓存因果图，按时间窗口刷新
+        self.cached_causal_graph: Optional[torch.Tensor] = None
+        self.last_graph_refresh: Optional[datetime] = None
+        self.refresh_interval = config.causal_refresh_minutes
     
     def discover_causal_graph(
         self,
         power_data: np.ndarray,
-        wind_direction: float
+        wind_direction: float,
+        force: bool = False
     ) -> Dict:
         """
         发现因果图谱
-        
+
         Args:
             power_data: [time_steps, num_turbines] 功率数据
             wind_direction: 当前风向
+            force: 是否忽略刷新间隔强制更新
         """
-        return self.wake_graph.build_graph(power_data, wind_direction)
+        should_refresh = force or self.last_graph_refresh is None
+        if not should_refresh:
+            delta = datetime.now() - self.last_graph_refresh
+            should_refresh = delta.total_seconds() > self.refresh_interval * 60
+
+        if should_refresh:
+            graph = self.wake_graph.build_graph(power_data, wind_direction)
+            self.cached_causal_graph = torch.tensor(graph, dtype=torch.float32)
+            self.last_graph_refresh = datetime.now()
+        return self.cached_causal_graph
+
+    def get_cached_graph(self) -> Optional[torch.Tensor]:
+        """获取最近一次离线更新的因果图"""
+        return self.cached_causal_graph
     
     def get_causal_embedding(
         self,
@@ -500,9 +546,13 @@ class CCPSystem(nn.Module):
 
         # 3. 因果一致性损失
         causal_loss = torch.tensor(0.0, device=predictions.device)
-        if causal_graph is not None and 'attention' in outputs:
+        candidate_graph = causal_graph
+        if candidate_graph is None:
+            candidate_graph = self.causal_layer.get_cached_graph()
+
+        if candidate_graph is not None and 'attention' in outputs:
             prepared_graph = self.causal_layer.prepare_causal_graph(
-                causal_graph, device=predictions.device
+                candidate_graph, device=predictions.device
             )
             normalized_graph = self.causal_layer.normalize_causal_graph(prepared_graph)
             causal_loss = self.causal_layer.compute_causal_consistency_loss(

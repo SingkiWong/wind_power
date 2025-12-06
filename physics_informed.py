@@ -37,19 +37,25 @@ class PhysicsLoss(nn.Module):
         rated_speed: float = 12.0,     # m/s
         rotor_diameter: float = 126.0, # m
         air_density: float = 1.225,    # kg/m³
-        betz_limit: float = 0.593      # 贝兹极限
+        betz_limit: float = 0.593,     # 贝兹极限
+        wake_decay_constant: float = 0.04,
+        residual_weight: float = 0.2,
     ):
         super().__init__()
-        self.rated_power = rated_power
-        self.cut_in_speed = cut_in_speed
-        self.cut_out_speed = cut_out_speed
-        self.rated_speed = rated_speed
-        self.rotor_diameter = rotor_diameter
-        self.air_density = air_density
-        self.betz_limit = betz_limit
-        
-        # 叶轮扫风面积
-        self.rotor_area = np.pi * (rotor_diameter / 2) ** 2
+        # 可学习的物理常数，使用softplus保证非负
+        self.raw_rated_power = nn.Parameter(torch.tensor(float(rated_power)))
+        self.raw_cut_in_speed = nn.Parameter(torch.tensor(float(cut_in_speed)))
+        self.raw_cut_out_speed = nn.Parameter(torch.tensor(float(cut_out_speed)))
+        self.raw_rated_speed = nn.Parameter(torch.tensor(float(rated_speed)))
+        self.raw_rotor_diameter = nn.Parameter(torch.tensor(float(rotor_diameter)))
+        self.raw_air_density = nn.Parameter(torch.tensor(float(air_density)))
+        self.raw_betz_limit = nn.Parameter(torch.tensor(float(betz_limit)))
+        self.raw_wake_decay = nn.Parameter(torch.tensor(float(wake_decay_constant)))
+
+        self.residual_weight = residual_weight
+
+        # 叶轮扫风面积（运行时使用正值）
+        self.register_buffer('pi_const', torch.tensor(np.pi))
     
     def betz_limit_loss(
         self,
@@ -63,11 +69,12 @@ class PhysicsLoss(nn.Module):
         P ≤ 0.5 * ρ * A * v³ * Cp_max
         """
         # 计算理论最大功率 (W -> MW)
+        rotor_area = self.physical_rotor_area(wind_speed.device)
         max_theoretical = (
-            0.5 * self.air_density * self.rotor_area * 
+            0.5 * self.air_density * rotor_area *
             (wind_speed ** 3) * self.betz_limit / 1e6
         )
-        
+
         # 限制最大理论功率不超过额定功率
         max_theoretical = torch.clamp(max_theoretical, max=self.rated_power)
         
@@ -130,14 +137,68 @@ class PhysicsLoss(nn.Module):
         """
         计算所有物理约束损失
         """
+        physics_baseline = self.power_curve_baseline(wind_speed)
+        residual_penalty = F.smooth_l1_loss(predicted_power, physics_baseline)
+
         losses = {
             'betz': self.betz_limit_loss(predicted_power, wind_speed),
             'power_curve': self.power_curve_loss(predicted_power, wind_speed),
             'non_negative': self.non_negative_loss(predicted_power),
-            'rated_limit': self.rated_power_loss(predicted_power)
+            'rated_limit': self.rated_power_loss(predicted_power),
+            'residual': residual_penalty * self.residual_weight,
         }
         losses['total_physics'] = sum(losses.values())
+        losses['physics_baseline'] = physics_baseline.detach()
         return losses
+
+    @property
+    def rated_power(self) -> torch.Tensor:
+        return F.softplus(self.raw_rated_power)
+
+    @property
+    def cut_in_speed(self) -> torch.Tensor:
+        return F.softplus(self.raw_cut_in_speed)
+
+    @property
+    def cut_out_speed(self) -> torch.Tensor:
+        return F.softplus(self.raw_cut_out_speed)
+
+    @property
+    def rated_speed(self) -> torch.Tensor:
+        return F.softplus(self.raw_rated_speed)
+
+    @property
+    def rotor_diameter(self) -> torch.Tensor:
+        return F.softplus(self.raw_rotor_diameter)
+
+    @property
+    def air_density(self) -> torch.Tensor:
+        return F.softplus(self.raw_air_density)
+
+    @property
+    def betz_limit(self) -> torch.Tensor:
+        return torch.clamp(F.softplus(self.raw_betz_limit), max=0.99)
+
+    @property
+    def wake_decay_constant(self) -> torch.Tensor:
+        return F.softplus(self.raw_wake_decay)
+
+    def physical_rotor_area(self, device: torch.device) -> torch.Tensor:
+        radius = self.rotor_diameter.to(device) / 2
+        return self.pi_const.to(device) * radius ** 2
+
+    def power_curve_baseline(self, wind_speed: torch.Tensor) -> torch.Tensor:
+        """使用可学习物理参数给出期望功率基线，供残差学习使用"""
+        ws = wind_speed
+        zero = torch.zeros_like(ws)
+        ramp = ((ws - self.cut_in_speed) / (self.rated_speed - self.cut_in_speed)).clamp(min=0)
+        ramp = (ramp ** 3) * self.rated_power
+        rated = torch.full_like(ws, self.rated_power)
+
+        baseline = torch.where(ws < self.cut_in_speed, zero, ramp)
+        baseline = torch.where(ws >= self.rated_speed, rated, baseline)
+        baseline = torch.where(ws >= self.cut_out_speed, zero, baseline)
+        return baseline
 
 
 class PhysicsGuidedAttention(nn.Module):

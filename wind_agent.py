@@ -19,6 +19,7 @@ from enum import Enum
 import json
 import numpy as np
 from datetime import datetime
+import torch.nn.functional as F
 
 
 class AgentRole(Enum):
@@ -62,6 +63,37 @@ class PredictionResult:
     reasoning_chain: List[str]
     evidence: List[Dict]
     warnings: List[str]
+
+
+class VectorIndex:
+    """轻量级向量索引，模拟向量数据库的语义检索能力"""
+
+    def __init__(self, dim: int = 128):
+        self.dim = dim
+        self.vectors: List[torch.Tensor] = []
+        self.metadata: List[Dict] = []
+
+    def _encode(self, text: str) -> torch.Tensor:
+        tokens = text.lower().split()
+        vec = torch.zeros(self.dim)
+        for tok in tokens:
+            idx = hash(tok) % self.dim
+            vec[idx] += 1.0
+        return F.normalize(vec, dim=0) if vec.norm() > 0 else vec
+
+    def add(self, doc: Dict):
+        content = doc.get('content', '') + ' ' + doc.get('title', '')
+        self.vectors.append(self._encode(content))
+        self.metadata.append(doc)
+
+    def search(self, query: str, top_k: int = 3) -> List[Dict]:
+        query_vec = self._encode(query)
+        if len(self.vectors) == 0:
+            return []
+        matrix = torch.stack(self.vectors)
+        scores = torch.mv(matrix, query_vec)
+        topk = torch.topk(scores, k=min(top_k, scores.numel())).indices.tolist()
+        return [self.metadata[i] for i in topk]
 
 
 class KnowledgeBase:
@@ -126,26 +158,19 @@ class KnowledgeBase:
                 }
             ]
         }
-        
-        # 简单的关键词索引
-        self.keyword_index = self._build_keyword_index()
-    
-    def _build_keyword_index(self) -> Dict[str, List[str]]:
-        """构建关键词索引"""
-        index = {}
-        keywords = ['功率', '尾流', '偏航', '故障', '振动', '温度', '风速', '风向']
-        
-        for category, docs in self.documents.items():
-            for doc in docs:
-                content = str(doc.get('content', '')) + str(doc.get('symptom', ''))
-                for keyword in keywords:
-                    if keyword in content:
-                        if keyword not in index:
-                            index[keyword] = []
-                        index[keyword].append(doc.get('id', ''))
-        
-        return index
-    
+
+        # 向量索引支持语义检索与动态扩充
+        self.vector_index = VectorIndex(dim=128)
+        for category_docs in self.documents.values():
+            for doc in category_docs:
+                self.vector_index.add(doc)
+
+    def ingest_documents(self, records: List[Dict]):
+        """动态接入SCADA日志或运维工单，保持知识库实时性"""
+        for rec in records:
+            rec.setdefault('id', f"EXT-{len(self.vector_index.metadata)+1:04d}")
+            self.vector_index.add(rec)
+
     def search(self, query: str, top_k: int = 3) -> List[Dict]:
         """
         检索相关文档
@@ -157,18 +182,7 @@ class KnowledgeBase:
         Returns:
             相关文档列表
         """
-        results = []
-        
-        # 简单的关键词匹配（实际应用中应使用向量检索）
-        for keyword, doc_ids in self.keyword_index.items():
-            if keyword in query:
-                for doc_id in doc_ids:
-                    for category, docs in self.documents.items():
-                        for doc in docs:
-                            if doc.get('id') == doc_id and doc not in results:
-                                results.append(doc)
-        
-        return results[:top_k]
+        return self.vector_index.search(query, top_k=top_k)
 
 
 class ChainOfThought:
