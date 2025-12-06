@@ -96,11 +96,11 @@ class LLMClient:
 
 
 class TemplateLLM(LLMClient):
-    """A lightweight fallback LLM that composes responses from context.
+    """A deterministic emergency fallback.
 
-    This is deterministic but consumes full prompts (context + evidence + chat
-    history), enabling richer outputs than rigid keyword if-else chains. Users
-    can replace it with a real LLM by implementing ``LLMClient``.
+    This class should *not* be used for production reasoning. It is kept only so
+    demo scripts do not crash when no external LLM is configured. A warning is
+    emitted at call time to encourage wiring a real backend.
     """
 
     def _join_messages(self, messages: Sequence[ChatTurn]) -> str:
@@ -116,11 +116,97 @@ class TemplateLLM(LLMClient):
     ) -> str:
         history = self._join_messages(messages or [])
         system_prefix = f"系统: {system}\n" if system else ""
+        warning = "【警告】未配置真实LLM，使用TemplateLLM仅做回显。\n"
         return (
-            f"{system_prefix}上下文:\n{prompt}\n"
+            f"{warning}{system_prefix}上下文:\n{prompt}\n"
             f"对话历史:\n{history}\n"
-            "请用简洁、结构化的中文回答，包含推理理由、风险、建议。"
-        )[:max_tokens * 4]
+            "请接入真实LLM以获得有意义的推理。"
+        )[: max_tokens * 4]
+
+
+class OpenAIChatLLM(LLMClient):
+    """OpenAI-compatible chat completion backend."""
+
+    def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None, base_url: Optional[str] = None):
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url
+
+        try:
+            import openai  # type: ignore
+
+            self._client = openai.Client(api_key=api_key, base_url=base_url)  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - runtime wiring
+            raise ImportError(
+                "openai python package is required for OpenAIChatLLM; install via `pip install openai`."
+            ) from exc
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        messages: Optional[Sequence[ChatTurn]] = None,
+        max_tokens: int = 512,
+    ) -> str:
+        chat_messages = []
+        if system:
+            chat_messages.append({"role": "system", "content": system})
+        for msg in messages or []:
+            chat_messages.append({"role": msg.role, "content": msg.content})
+        chat_messages.append({"role": "user", "content": prompt})
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=chat_messages,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content  # type: ignore[no-any-return]
+
+
+class TransformersLLM(LLMClient):
+    """HuggingFace transformers text-generation backend."""
+
+    def __init__(self, model: str = "Qwen/Qwen2.5-0.5B", **pipeline_kwargs: Any):
+        try:
+            from transformers import pipeline  # type: ignore
+        except Exception as exc:  # pragma: no cover - runtime wiring
+            raise ImportError(
+                "transformers is required for TransformersLLM; install via `pip install transformers`."
+            ) from exc
+
+        self.generator = pipeline("text-generation", model=model, **pipeline_kwargs)
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        messages: Optional[Sequence[ChatTurn]] = None,
+        max_tokens: int = 512,
+    ) -> str:
+        system_prefix = f"[SYSTEM]{system}\n" if system else ""
+        history = "\n".join(f"[{m.role}]{m.content}" for m in messages or [])
+        full_prompt = f"{system_prefix}{history}\n{prompt}\n回答:"
+        output = self.generator(full_prompt, max_new_tokens=max_tokens, num_return_sequences=1)
+        return output[0]["generated_text"][len(full_prompt) :].strip()
+
+
+def resolve_llm_from_env() -> LLMClient:
+    """Select a production-ready LLM backend using environment hints."""
+
+    import os
+
+    provider = os.getenv("WIND_AGENT_LLM", "openai").lower()
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            return OpenAIChatLLM(model=os.getenv("WIND_AGENT_LLM_MODEL", "gpt-4o-mini"), api_key=api_key)
+    if provider == "transformers":
+        return TransformersLLM(model=os.getenv("WIND_AGENT_LLM_MODEL", "Qwen/Qwen2.5-0.5B"))
+
+    raise ValueError(
+        "No valid LLM configured. Set OPENAI_API_KEY or WIND_AGENT_LLM=transformers with a local model."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -129,23 +215,49 @@ class TemplateLLM(LLMClient):
 
 
 class VectorIndex:
-    def __init__(self, dim: int = 128, embedding_fn: Optional[Callable[[str], torch.Tensor]] = None):
+    """Lightweight semantic index with pluggable encoder.
+
+    If `sentence_transformers` is available, a multilingual embedding model is
+    used automatically. Otherwise, a character-level trigram encoder is used as a
+    deterministic fallback (better than keyword exact match but still limited).
+    """
+
+    def __init__(self, dim: int = 384, embedding_fn: Optional[Callable[[str], torch.Tensor]] = None):
         self.dim = dim
-        self.embedding_fn = embedding_fn or self._encode
+        self.embedding_fn = embedding_fn or self._build_encoder()
         self.vectors: List[torch.Tensor] = []
         self.metadata: List[Dict] = []
 
-    def _encode(self, text: str) -> torch.Tensor:
-        tokens = text.lower().split()
-        vec = torch.zeros(self.dim)
-        for tok in tokens:
-            idx = hash(tok) % self.dim
-            vec[idx] += 1.0
-        return F.normalize(vec, dim=0) if vec.norm() > 0 else vec
+    def _build_encoder(self) -> Callable[[str], torch.Tensor]:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+
+            model = SentenceTransformer("BAAI/bge-m3")
+
+            def encode(text: str) -> torch.Tensor:
+                with torch.inference_mode():
+                    emb = model.encode(text, convert_to_tensor=True, normalize_embeddings=True)
+                return emb.to(dtype=torch.float)
+
+            return encode
+        except Exception:
+            vocab = {}
+
+            def encode(text: str) -> torch.Tensor:
+                vec = torch.zeros(self.dim)
+                lowered = text.lower().replace(" ", "")
+                for i in range(len(lowered) - 2):
+                    tri = lowered[i : i + 3]
+                    idx = vocab.setdefault(tri, len(vocab) % self.dim)
+                    vec[idx] += 1.0
+                return F.normalize(vec, dim=0) if vec.norm() > 0 else vec
+
+            return encode
 
     def add(self, doc: Dict):
         content = doc.get("content", "") + " " + doc.get("title", "")
-        self.vectors.append(self.embedding_fn(content))
+        embedding = self.embedding_fn(content)
+        self.vectors.append(embedding)
         self.metadata.append(doc)
 
     def search(self, query: str, top_k: int = 3) -> List[Dict]:
@@ -160,7 +272,7 @@ class VectorIndex:
 
 class KnowledgeBase:
     def __init__(self, embedding_fn: Optional[Callable[[str], torch.Tensor]] = None):
-        self.vector_index = VectorIndex(dim=128, embedding_fn=embedding_fn)
+        self.vector_index = VectorIndex(dim=384, embedding_fn=embedding_fn)
         self.documents: Dict[str, List[Dict]] = {
             "technical_manual": [
                 {
@@ -210,6 +322,19 @@ class KnowledgeBase:
         for docs in self.documents.values():
             for doc in docs:
                 self.vector_index.add(doc)
+
+    def reset(self):
+        self.vector_index = VectorIndex(dim=self.vector_index.dim, embedding_fn=self.vector_index.embedding_fn)
+        for docs in self.documents.values():
+            for doc in docs:
+                self.vector_index.add(doc)
+
+    def load_jsonl(self, path: str, namespace: str = "external"):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                record = json.loads(line)
+                record.setdefault("namespace", namespace)
+                self.ingest_documents([record])
 
     def ingest_documents(self, records: List[Dict]):
         for rec in records:
@@ -289,20 +414,48 @@ class ReflectionAgent:
         ) or "- 无"
         prompt = (
             "请作为审查员，评估下面的风电功率预测是否合理，给出原因和改进建议。\n"
+            "以JSON输出: {\"criticisms\":[], \"corrections\":[], \"confidence_penalty\":0, \"explanation\": \"\"}\\n"
+            "可用修正规范: {type: clamp|min|max|set|scale, value/max/min/factor: number}.\\n"
             f"预测功率: {context.predicted_power:.2f}MW\n"
             f"上下文:\n{context.to_prompt()}\n"
             f"检索证据:\n{evidence_snippets}\n"
             f"已发现的数值问题: {json.dumps(numeric_criticisms, ensure_ascii=False)}"
         )
-        critique = self.llm.generate(prompt, system="物理一致性审查员", max_tokens=400)
-        score = max(0, 100 - 10 * len(numeric_criticisms))
+        critique_raw = self.llm.generate(prompt, system="物理一致性审查员", max_tokens=480)
+        llm_criticisms: List[str] = []
+        llm_corrections: List[Dict[str, Any]] = []
+        confidence_penalty = 0.0
+        try:
+            parsed = json.loads(critique_raw)
+            llm_criticisms = parsed.get("criticisms", [])
+            llm_corrections = [c for c in parsed.get("corrections", []) if isinstance(c, dict)]
+            confidence_penalty = float(parsed.get("confidence_penalty", 0))
+            critique_text = parsed.get("explanation", critique_raw)
+        except Exception:
+            critique_text = critique_raw
+        merged_corrections = corrections + self._sanitize_corrections(llm_corrections)
+        merged_criticisms = list(dict.fromkeys(numeric_criticisms + llm_criticisms))
+        score = max(0, 100 - 10 * len(numeric_criticisms) - int(confidence_penalty))
         return {
-            "criticisms": numeric_criticisms,
-            "llm_feedback": critique,
-            "corrections": corrections,
+            "criticisms": merged_criticisms,
+            "llm_feedback": critique_text,
+            "corrections": merged_corrections,
             "physical_consistency_score": score,
-            "needs_refinement": len(corrections) > 0,
+            "needs_refinement": len(merged_corrections) > 0,
         }
+
+    def _sanitize_corrections(self, corrections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        allowed_types = {"clamp", "set", "scale"}
+        sanitized: List[Dict[str, Any]] = []
+        for corr in corrections:
+            if corr.get("type") not in allowed_types:
+                continue
+            clean = {"type": corr["type"]}
+            for key in ("min", "max", "value", "factor"):
+                if key in corr and isinstance(corr[key], (int, float)):
+                    clean[key] = float(corr[key])
+            sanitized.append(clean)
+        return sanitized
 
     def apply_corrections(self, prediction: float, corrections: List[Dict]) -> float:
         power = prediction
@@ -333,7 +486,13 @@ class WindAgent:
         embedding_fn: Optional[Callable[[str], torch.Tensor]] = None,
     ):
         self.prediction_model = prediction_model
-        self.llm = llm or TemplateLLM()
+        if llm is not None:
+            self.llm = llm
+        else:
+            try:
+                self.llm = resolve_llm_from_env()
+            except Exception:
+                self.llm = TemplateLLM()
         self.knowledge_base = KnowledgeBase(embedding_fn=embedding_fn)
         self.cot = ChainOfThought(self.llm)
         self.reflector = ReflectionAgent(self.llm, rated_power)
