@@ -42,6 +42,7 @@
 - **TimeKAN**: 多尺度时间序列KAN变体
 - **PhysicsInformedKAN**: 物理约束KAN（贝兹极限、功率曲线约束）
 - **符号回归**: 从学习到的函数发现数学公式
+- **SelectiveKAN / Mamba-KAN Hybrid**: 关键层使用KAN或与Mamba混合，降低计算时延
 
 ### 2. Mamba模块 (`mamba_module.py`)
 - **SelectiveSSM**: 选择性状态空间模型核心
@@ -57,12 +58,15 @@
 - **PhysicsGuidedAttention**: 物理引导注意力机制
 - **PhysicsInformedTransformer**: 完整的物理信息Transformer
 - **DigitalTwin**: 数字孪生虚拟感知
+- **Learnable Physics Parameters**: 尾流衰减、切入/切出风速等可设为可学习参数，随数据自适应
+- **Residual Physics Modeling**: 预测 = 物理基线 + 神经网络残差，提升现实场景泛化
 
 ### 4. 因果发现模块 (`causal_discovery.py`)
 - **PCMCI**: Peter-Clark Momentary Conditional Independence算法
 - **LiNGAM**: 线性非高斯无环模型
 - **DynamicWakeGraph**: 动态尾流因果图谱
 - **PhysicsConstrainedCausalDiscovery**: 物理约束因果发现
+- **Graph Refresh Scheduling**: 支持离线周期刷新图谱并在推理时复用缓存，降低在线计算
 
 ### 5. 轻量化模型模块 (`lightweight_models.py`)
 - **TSMixer**: 全MLP架构
@@ -77,6 +81,7 @@
 - **ReflectionAgent**: 反思智能体（预测-反思-修正闭环）
 - **WindAgent**: 完整智能体
 - **ReportGenerator**: 报告生成器
+- **Vector RAG**: 语义向量检索与动态文档摄取，替代静态关键词匹配
 
 ### 7. CCP框架 (`ccp_framework.py`)
 - **CCPConfig**: 系统配置
@@ -84,6 +89,13 @@
 - **CausalReasoningLayer**: 因果推理层
 - **CognitiveInterfaceLayer**: 认知交互层
 - **CCPSystem**: 完整系统
+- **Dynamic Loss Weighting**: 支持静态/不确定度自适应损失平衡与课程学习分阶段开启
+- **Teacher-Student Distillation**: 可选TinyTimeMixer蒸馏路径，满足边缘部署时延
+
+### 8. 训练与部署 (`train_eval.py`)
+- **Curriculum Learning**: 先优化数据损失，逐步引入物理/因果约束，避免梯度冲突
+- **Causal Graph Gating**: 训练/验证均可按epoch调度因果图使用并缓存刷新
+- **Student Export**: 同步导出教师与TinyTimeMixer学生模型以满足低算力场景
 
 ## 快速开始
 
@@ -101,13 +113,14 @@ from ccp_framework import create_ccp_system
 # 创建CCP系统
 system = create_ccp_system(
     backbone="mamba",      # 可选: "mamba", "transformer", "ttm"
-    use_kan=True,          # 是否使用KAN增强
+    use_kan=True,          # 是否使用KAN增强（支持SelectiveKAN或Hybrid模式）
+    kan_mode="hybrid",    # "full" | "selective" | "hybrid"，兼顾精度与效率
     input_len=96,          # 输入序列长度
     output_len=24,         # 预测长度
     num_features=5         # 特征数量
 )
 
-# 预测
+# 预测（自动复用缓存的尾流因果图，降低推理开销）
 import torch
 x = torch.randn(8, 96, 5)  # [batch, seq_len, features]
 wind_direction = torch.rand(8) * 360
@@ -141,8 +154,12 @@ from train_eval import run_experiment
 result = run_experiment(
     backbone="mamba",
     use_kan=True,
+    kan_mode="hybrid",           # 计算友好模式
     num_epochs=50,
-    batch_size=32
+    batch_size=32,
+    loss_weighting="uncertainty",# 动态损失平衡: static / uncertainty
+    curriculum_warmup=5,          # 前5个epoch仅优化数据损失
+    distill_student=True          # 同步蒸馏TinyTimeMixer学生模型
 )
 
 print(f"Test RMSE: {result['metrics']['rmse']:.4f}")
@@ -154,22 +171,26 @@ print(f"Test RMSE: {result['metrics']['rmse']:.4f}")
 - 将贝兹极限、功率曲线等物理约束嵌入损失函数
 - 物理引导的注意力机制，确保模型关注正确的上游风机
 - 注意力热图与CFD模拟尾流区域的对比验证
+- 物理参数可学习并支持残差建模，适应设备老化和场景漂移
 
 ### 2. 结构可解释性
 - PCMCI算法从数据中发现真实因果关系
 - 动态尾流拓扑图谱随风向变化
 - 故障传播路径追踪
+- 因果图可缓存并按调度刷新，降低实时推理开销
 
 ### 3. 认知可解释性
 - 自然语言形式的预测解释
 - 思维链(CoT)推理过程
 - RAG检索历史案例和技术文档
 - 预测-反思-修正闭环
+- 支持向量语义检索的RAG引擎，动态摄取运维/日志文档
 
 ### 4. 轻量化设计
 - KAN以1/10参数量达到MLP精度
 - Mamba实现O(L)线性复杂度
 - TTM百万参数击败数十亿大模型
+- 支持SelectiveKAN/Hybrid与TinyTimeMixer蒸馏，兼顾精度与推理时延
 
 ## 模型参数量对比
 
