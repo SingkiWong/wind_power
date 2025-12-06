@@ -50,6 +50,7 @@ class CCPConfig:
     cut_out_speed: float = 25.0   # 切出风速 (m/s)
     physics_mask_threshold: float = 0.6  # 偏离基线超过该比例视为限电/异常
     physics_mask_floor: float = 0.05     # 基线归一化分母平滑项（额定功率比例）
+    physics_prior_weight: float = 1e-3   # 物理参数正则，防止可学习常数漂移
     
     # 训练配置
     lambda_physics: float = 0.1   # 物理损失权重
@@ -333,7 +334,13 @@ class CausalReasoningLayer(nn.Module):
         
         # 平均注意力头
         avg_attn = attention_weights.mean(dim=1)  # [batch, seq, seq]
-        
+
+        # 将因果图调整到与注意力矩阵相同的分辨率
+        if causal_graph.dim() == 2 and causal_graph.shape[-1] != avg_attn.shape[-1]:
+            graph = causal_graph.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+            graph = F.interpolate(graph, size=(avg_attn.shape[-2], avg_attn.shape[-1]), mode='bilinear', align_corners=False)
+            causal_graph = graph.squeeze(0).squeeze(0)
+
         # 扩展因果图到batch维度
         causal_expanded = causal_graph.unsqueeze(0).expand(avg_attn.shape[0], -1, -1)
         
@@ -589,7 +596,10 @@ class CCPSystem(nn.Module):
         physics_losses = self.physical_layer.physics_loss(
             pred_power.flatten(), wind_speed.flatten(), mask=physics_mask
         )
-        physics_loss = physics_losses['total_physics']
+        physics_prior = self.physical_layer.physics_loss.parameter_prior_loss(
+            self.config.physics_prior_weight
+        )
+        physics_loss = physics_losses['total_physics'] + physics_prior
 
         # 3. 因果一致性损失
         causal_loss = torch.tensor(0.0, device=predictions.device)
@@ -634,6 +644,7 @@ class CCPSystem(nn.Module):
             'total': total_loss.item(),
             'data': data_loss.item(),
             'physics': physics_loss.item(),
+            'physics_prior': physics_prior.item(),
             'physics_consistency': physics_consistency.item(),
             'causal': causal_loss.item() if isinstance(causal_loss, torch.Tensor) else causal_loss,
             'w_data': effective_weights['data'],

@@ -37,6 +37,7 @@ class PredictionContext:
     causal_graph: Optional[Dict] = None
     predicted_power: float = 0.0
     confidence: float = 0.5
+    session_directives: List[str] = field(default_factory=list)
 
     def to_prompt(self) -> str:
         history = ", ".join(f"{p:.2f}MW" for p in self.historical_power[-6:]) or "无"
@@ -728,6 +729,42 @@ class WindAgent:
             narrative=narrative,
         )
 
+    def explain_prediction(self, context: PredictionContext) -> ExplanationResult:
+        """Provide a structured explanation without re-running the predictor."""
+
+        evidence = self.knowledge_base.search(
+            f"风速{context.wind_speed} 风向{context.wind_direction} 功率解释"
+        )
+        reasoning_chain = self.cot.generate(
+            context, context.predicted_power, evidence
+        )
+        reflection = self.reflector.reflect(context, evidence)
+
+        confidence_level = (
+            "高" if context.confidence >= 0.8 else "中" if context.confidence >= 0.4 else "低"
+        )
+        recommendations = []
+        if reflection["criticisms"]:
+            recommendations.append("请复核传感器数据或限电状态，因反思提示存在异常。")
+        if reflection["needs_refinement"]:
+            recommendations.append("已执行安全护栏校正，建议结合SCADA再验证。")
+        if not recommendations:
+            recommendations.append("预测在物理范围内，无需额外操作。")
+
+        summary = (
+            f"预测功率: {context.predicted_power:.2f}MW, 置信度: {context.confidence*100:.0f}%\n"
+            f"LLM反思: {reflection['llm_feedback']}\n"
+            f"主要警告: {', '.join(reflection['criticisms']) or '无'}"
+        )
+
+        return ExplanationResult(
+            summary=summary,
+            reasoning_chain=reasoning_chain,
+            evidence=evidence,
+            confidence_level=confidence_level,
+            recommendations=recommendations,
+        )
+
     def answer_question(
         self,
         question: str,
@@ -802,6 +839,31 @@ class WindAgent:
         while self.conversation_history and total_chars > self.conversation_max_chars:
             removed = self.conversation_history.pop(0)
             total_chars -= len(removed.content)
+
+
+class ReportGenerator:
+    """Lightweight reporter to summarize multiple PredictionContext entries."""
+
+    def __init__(self, agent: WindAgent):
+        self.agent = agent
+
+    def generate_report(self, contexts: List[PredictionContext], report_type: str = "summary") -> str:
+        lines = [
+            "================ 风电预测报告 ================",
+            f"报告类型: {report_type}",
+            f"生成时间: {datetime.now()}",
+            "----------------------------------------------",
+        ]
+        for ctx in contexts:
+            lines.append(
+                (
+                    f"风机 T{ctx.turbine_id}: 预测 {ctx.predicted_power:.2f}MW, 置信度 {ctx.confidence*100:.0f}% | "
+                    f"风速 {ctx.wind_speed:.1f}m/s, 风向 {ctx.wind_direction:.0f}°"
+                )
+            )
+            lines.append(f"- 持久指令: {'; '.join(ctx.session_directives) if ctx.session_directives else '无'}")
+        lines.append("==============================================")
+        return "\n".join(lines)
 
 
 if __name__ == "__main__":

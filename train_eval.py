@@ -39,7 +39,8 @@ class WindPowerDataset(Dataset):
         data: np.ndarray,
         input_len: int = 96,
         output_len: int = 24,
-        stride: int = 1
+        stride: int = 1,
+        return_causal_graph: bool = True,
     ):
         """
         Args:
@@ -52,6 +53,7 @@ class WindPowerDataset(Dataset):
         self.input_len = input_len
         self.output_len = output_len
         self.stride = stride
+        self.return_causal_graph = return_causal_graph
         
         # 计算有效样本数
         total_len = input_len + output_len
@@ -71,12 +73,20 @@ class WindPowerDataset(Dataset):
         # 假设第一列是功率，第二列是风速，第三列是风向
         wind_speed = self.data[start:mid, 1].mean() if self.data.shape[1] > 1 else torch.tensor(10.0)
         wind_direction = self.data[mid-1, 2] if self.data.shape[1] > 2 else torch.tensor(270.0)
-        
+
+        causal_graph = None
+        if self.return_causal_graph:
+            # 简易的时间邻近因果图：对角线为1，相邻时间步呈指数衰减
+            positions = torch.arange(self.input_len)
+            dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs().float()
+            causal_graph = torch.exp(-dist / 6.0)
+
         return {
             'x': x,
             'y': y,
             'wind_speed': wind_speed,
-            'wind_direction': wind_direction
+            'wind_direction': wind_direction,
+            'causal_graph': causal_graph,
         }
 
 
@@ -188,6 +198,10 @@ class Trainer:
             wind_speed = batch['wind_speed'].to(self.device)
             wind_direction = batch['wind_direction'].to(self.device)
             causal_graph = batch.get('causal_graph')
+            if causal_graph is not None:
+                causal_graph = causal_graph.to(self.device)
+            if causal_graph is not None:
+                causal_graph = causal_graph.to(self.device)
 
             # 扩展wind_speed到序列长度
             if wind_speed.dim() == 1:

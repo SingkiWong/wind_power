@@ -54,6 +54,16 @@ class PhysicsLoss(nn.Module):
 
         self.residual_weight = residual_weight
 
+        # priors用于防止可学习物理常数漂移过远
+        self.register_buffer('rated_power_prior', torch.tensor(float(rated_power)))
+        self.register_buffer('cut_in_prior', torch.tensor(float(cut_in_speed)))
+        self.register_buffer('cut_out_prior', torch.tensor(float(cut_out_speed)))
+        self.register_buffer('rated_speed_prior', torch.tensor(float(rated_speed)))
+        self.register_buffer('rotor_diameter_prior', torch.tensor(float(rotor_diameter)))
+        self.register_buffer('air_density_prior', torch.tensor(float(air_density)))
+        self.register_buffer('betz_prior', torch.tensor(float(betz_limit)))
+        self.register_buffer('wake_decay_prior', torch.tensor(float(wake_decay_constant)))
+
         # 叶轮扫风面积（运行时使用正值）
         self.register_buffer('pi_const', torch.tensor(np.pi))
     
@@ -201,6 +211,22 @@ class PhysicsLoss(nn.Module):
     def physical_rotor_area(self, device: torch.device) -> torch.Tensor:
         radius = self.rotor_diameter.to(device) / 2
         return self.pi_const.to(device) * radius ** 2
+
+    def parameter_prior_loss(self, weight: float = 1e-3) -> torch.Tensor:
+        """Penalize large drifts of learnable physics constants from their priors."""
+
+        deltas = [
+            (self.rated_power - self.rated_power_prior) ** 2,
+            (self.cut_in_speed - self.cut_in_prior) ** 2,
+            (self.cut_out_speed - self.cut_out_prior) ** 2,
+            (self.rated_speed - self.rated_speed_prior) ** 2,
+            (self.rotor_diameter - self.rotor_diameter_prior) ** 2,
+            (self.air_density - self.air_density_prior) ** 2,
+            (self.betz_limit - self.betz_prior) ** 2,
+            (self.wake_decay_constant - self.wake_decay_prior) ** 2,
+        ]
+        stacked = torch.stack([d.mean() for d in deltas])
+        return weight * stacked.mean()
 
     def power_curve_baseline(self, wind_speed: torch.Tensor) -> torch.Tensor:
         """使用可学习物理参数给出期望功率基线，供残差学习使用"""
