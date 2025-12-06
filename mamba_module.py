@@ -196,8 +196,9 @@ class MambaBlock(nn.Module):
 class BiMamba(nn.Module):
     """
     双向Mamba：同时利用过去和未来信息
-    
-    在离线训练和数据补全任务中特别有用
+
+    在离线训练和数据补全任务中特别有用；预测场景仅应在编码器侧使用，
+    避免在解码器或自回归阶段泄漏未来信息。
     """
     
     def __init__(

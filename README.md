@@ -48,13 +48,14 @@
 - **SelectiveSSM**: 选择性状态空间模型核心
 - **WindMambaformer**: 风电专用Mamba-Transformer混合架构
 - **SiMBA**: 简化Mamba架构，支持多变量
-- **BiMamba**: 双向Mamba，用于数据补全
+- **BiMamba**: 双向Mamba，用于数据补全；预测任务仅推荐放在编码器以避免未来信息泄漏
 
 ### 3. 物理信息模块 (`physics_informed.py`)
 - **PhysicsLoss**: 物理约束损失函数集合
   - 贝兹极限约束
   - 功率曲线约束
   - 非负约束
+- **Curtailment Masking**: 基于物理基线与实测功率的偏离自适应屏蔽限电/脏数据，避免错误惩罚
 - **PhysicsGuidedAttention**: 物理引导注意力机制
 - **PhysicsInformedTransformer**: 完整的物理信息Transformer
 - **DigitalTwin**: 数字孪生虚拟感知
@@ -86,10 +87,12 @@
 ### 7. CCP框架 (`ccp_framework.py`)
 - **CCPConfig**: 系统配置
 - **PhysicalPerceptionLayer**: 物理感知层
+- **RevIN Stabilization**: 可选可逆实例归一化，自动对齐风速/气压/功率量纲，防止KAN和Mamba梯度病态
 - **CausalReasoningLayer**: 因果推理层
 - **CognitiveInterfaceLayer**: 认知交互层
 - **CCPSystem**: 完整系统
 - **Dynamic Loss Weighting**: 支持静态/不确定度自适应损失平衡与课程学习分阶段开启
+- **Heteroscedastic Confidence**: 功率通道输出log-variance并用高斯NLL训练，置信度来源于方差而非随机构造
 - **Teacher-Student Distillation**: 可选TinyTimeMixer蒸馏路径，满足边缘部署时延
 
 ### 8. 训练与部署 (`train_eval.py`)

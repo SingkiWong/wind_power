@@ -80,7 +80,7 @@ class PhysicsLoss(nn.Module):
         
         # 惩罚超过理论极限的预测
         violation = F.relu(predicted_power - max_theoretical)
-        return violation.mean()
+        return violation
     
     def power_curve_loss(
         self,
@@ -90,12 +90,12 @@ class PhysicsLoss(nn.Module):
         """
         功率曲线物理约束损失
         """
-        loss = torch.tensor(0.0, device=predicted_power.device)
+        loss = torch.zeros_like(predicted_power)
         
         # 区域1: 切入风速以下
         mask_below_cutin = wind_speed < self.cut_in_speed
         if mask_below_cutin.any():
-            loss = loss + (predicted_power[mask_below_cutin] ** 2).mean()
+            loss = loss + F.relu(predicted_power) * mask_below_cutin.float()
         
         # 区域2: 爬坡区 - 功率与风速立方成正比
         mask_ramp = (wind_speed >= self.cut_in_speed) & (wind_speed < self.rated_speed)
@@ -106,46 +106,61 @@ class PhysicsLoss(nn.Module):
             ) ** 3
             actual_ratio = predicted_power[mask_ramp] / self.rated_power
             deviation = (actual_ratio - expected_ratio).abs()
-            loss = loss + F.relu(deviation - 0.15).mean()
+            loss = loss + F.relu(deviation - 0.15)
         
         # 区域3: 额定区
         mask_rated = (wind_speed >= self.rated_speed) & (wind_speed < self.cut_out_speed)
         if mask_rated.any():
             deviation = (predicted_power[mask_rated] - self.rated_power).abs()
-            loss = loss + F.relu(deviation - 0.1 * self.rated_power).mean()
+            loss = loss + F.relu(deviation - 0.1 * self.rated_power)
         
         # 区域4: 切出风速以上
         mask_above_cutout = wind_speed >= self.cut_out_speed
         if mask_above_cutout.any():
-            loss = loss + (predicted_power[mask_above_cutout] ** 2).mean()
-        
+            loss = loss + (predicted_power ** 2) * mask_above_cutout.float()
+
         return loss
     
     def non_negative_loss(self, predicted_power: torch.Tensor) -> torch.Tensor:
         """非负功率约束"""
-        return F.relu(-predicted_power).mean()
+        return F.relu(-predicted_power)
     
     def rated_power_loss(self, predicted_power: torch.Tensor) -> torch.Tensor:
         """额定功率上限约束"""
-        return F.relu(predicted_power - self.rated_power).mean()
+        return F.relu(predicted_power - self.rated_power)
     
     def forward(
         self,
         predicted_power: torch.Tensor,
-        wind_speed: torch.Tensor
+        wind_speed: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         计算所有物理约束损失
+
+        Args:
+            predicted_power: 预测功率
+            wind_speed: 对应风速
+            mask: 可选的有效样本权重（用于屏蔽限电/异常值）
         """
         physics_baseline = self.power_curve_baseline(wind_speed)
-        residual_penalty = F.smooth_l1_loss(predicted_power, physics_baseline)
+        residual_penalty = F.smooth_l1_loss(
+            predicted_power, physics_baseline, reduction='none'
+        )
+
+        def _masked_mean(tensor: torch.Tensor) -> torch.Tensor:
+            if mask is None:
+                return tensor.mean()
+            weighted = tensor * mask
+            denom = mask.sum().clamp_min(1.0)
+            return weighted.sum() / denom
 
         losses = {
-            'betz': self.betz_limit_loss(predicted_power, wind_speed),
-            'power_curve': self.power_curve_loss(predicted_power, wind_speed),
-            'non_negative': self.non_negative_loss(predicted_power),
-            'rated_limit': self.rated_power_loss(predicted_power),
-            'residual': residual_penalty * self.residual_weight,
+            'betz': _masked_mean(self.betz_limit_loss(predicted_power, wind_speed)),
+            'power_curve': _masked_mean(self.power_curve_loss(predicted_power, wind_speed)),
+            'non_negative': _masked_mean(self.non_negative_loss(predicted_power)),
+            'rated_limit': _masked_mean(self.rated_power_loss(predicted_power)),
+            'residual': _masked_mean(residual_penalty) * self.residual_weight,
         }
         losses['total_physics'] = sum(losses.values())
         losses['physics_baseline'] = physics_baseline.detach()

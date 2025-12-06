@@ -25,7 +25,7 @@ from kan_module import KAN, TimeKAN, PhysicsInformedKAN
 from mamba_module import WindMambaformer, SiMBA, MambaBlock
 from physics_informed import PhysicsLoss, PhysicsGuidedAttention, PhysicsInformedTransformer
 from causal_discovery import PCMCI, DynamicWakeGraph, PhysicsConstrainedCausalDiscovery
-from lightweight_models import TinyTimeMixer, PatchTSMixer, TSMixer
+from lightweight_models import TinyTimeMixer, PatchTSMixer, TSMixer, RevIN
 from wind_agent import WindAgent, PredictionContext, ReportGenerator
 
 
@@ -48,6 +48,8 @@ class CCPConfig:
     rated_power: float = 2.0      # 额定功率 (MW)
     cut_in_speed: float = 3.0     # 切入风速 (m/s)
     cut_out_speed: float = 25.0   # 切出风速 (m/s)
+    physics_mask_threshold: float = 0.6  # 偏离基线超过该比例视为限电/异常
+    physics_mask_floor: float = 0.05     # 基线归一化分母平滑项（额定功率比例）
     
     # 训练配置
     lambda_physics: float = 0.1   # 物理损失权重
@@ -65,6 +67,7 @@ class CCPConfig:
     kan_usage: str = "selective"  # "full" 对所有时间步用KAN, "selective" 只对关键步
     kan_focus_steps: int = 4       # 使用KAN精修的末尾时间步数量
     use_physics_attention: bool = True  # 是否使用物理引导注意力
+    use_revin: bool = True        # 是否使用可逆实例归一化稳定分布
 
     # 因果图更新节奏
     causal_refresh_minutes: int = 15   # 离线尾流图更新间隔
@@ -85,6 +88,8 @@ class PhysicalPerceptionLayer(nn.Module):
     def __init__(self, config: CCPConfig):
         super().__init__()
         self.config = config
+
+        self.revin = RevIN(config.num_features) if config.use_revin else None
         
         # 输入嵌入
         self.input_embed = nn.Linear(config.num_features, config.d_model)
@@ -149,6 +154,9 @@ class PhysicalPerceptionLayer(nn.Module):
             )
         else:
             self.kan_head = self.linear_head
+
+        # 异方差噪声建模（仅对功率通道提供 log-variance）
+        self.power_uncertainty_head = nn.Linear(config.d_model, 1)
         
         # 物理损失计算
         self.physics_loss = PhysicsLoss(
@@ -163,17 +171,23 @@ class PhysicalPerceptionLayer(nn.Module):
         x: torch.Tensor,
         wind_direction: Optional[torch.Tensor] = None,
         return_attention: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         前向传播
-        
+
         Args:
             x: [batch, input_len, num_features]
             wind_direction: [batch] 风向（可选）
             return_attention: 是否返回注意力权重
+        Returns:
+            predictions, attention, power_log_var
         """
         batch_size = x.shape[0]
-        
+
+        # 输入归一化，防止不同物理量级带来的梯度病态
+        if self.revin is not None:
+            x = self.revin(x, 'norm')
+
         # 输入嵌入
         x_embed = self.input_embed(x)  # [batch, input_len, d_model]
         
@@ -210,8 +224,14 @@ class PhysicalPerceptionLayer(nn.Module):
             output = out_flat.reshape(b, t, -1)
         else:
             output = self.linear_head(backbone_out)
-        
-        return output, attention_weights
+
+        power_log_var = torch.tanh(self.power_uncertainty_head(backbone_out))
+
+        # 反归一化恢复物理量纲
+        if self.revin is not None:
+            output = self.revin(output, 'denorm')
+
+        return output, attention_weights, power_log_var
 
 
 class CausalReasoningLayer(nn.Module):
@@ -489,18 +509,23 @@ class CCPSystem(nn.Module):
             outputs: 包含预测、置信度、注意力等的字典
         """
         # 物理感知层
-        predictions, attention = self.physical_layer(
+        predictions, attention, power_log_var = self.physical_layer(
             x, wind_direction, return_attention
         )
-        
-        # 估计置信度（基于输入特征的变异性）
-        x_embed = self.physical_layer.input_embed(x)
-        x_mean = x_embed.mean(dim=1)  # [batch, d_model]
-        confidence = self.confidence_net(x_mean)  # [batch, 1]
-        
+
+        # 基于预测方差估计置信度（方差越大置信度越低）
+        if power_log_var is not None:
+            avg_log_var = power_log_var.mean(dim=[1, 2])
+            confidence = torch.sigmoid(-avg_log_var)
+        else:
+            x_embed = self.physical_layer.input_embed(x)
+            x_mean = x_embed.mean(dim=1)  # [batch, d_model]
+            confidence = self.confidence_net(x_mean)  # [batch, 1]
+
         outputs = {
             'predictions': predictions,
             'confidence': confidence.squeeze(-1),
+            'power_log_var': power_log_var,
         }
         
         if return_attention and attention is not None:
@@ -522,6 +547,7 @@ class CCPSystem(nn.Module):
         L_total = L_data + λ_phy * L_physics + λ_causal * L_causal
         """
         predictions = outputs['predictions']
+        power_log_var = outputs.get('power_log_var')
 
         physics_weight = self._compute_curriculum_weight(
             self.config.lambda_physics,
@@ -534,13 +560,34 @@ class CCPSystem(nn.Module):
             self.config.curriculum_start_causal
         )
 
-        # 1. 数据损失 (MSE)
-        data_loss = F.mse_loss(predictions, targets)
+        # 1. 数据损失（功率采用高斯NLL，其余特征使用MSE）
+        target_power = targets[..., 0]
+        pred_power = predictions[..., 0]
+        feature_loss = F.mse_loss(predictions[..., 1:], targets[..., 1:]) if predictions.shape[-1] > 1 else 0.0
+
+        if power_log_var is not None:
+            log_var = power_log_var.squeeze(-1)
+            log_var = torch.clamp(log_var, min=-10.0, max=6.0)
+            nll = 0.5 * (log_var + (pred_power - target_power) ** 2 / torch.exp(log_var))
+            power_loss = nll.mean()
+        else:
+            power_loss = F.mse_loss(pred_power, target_power)
+
+        data_loss = power_loss + (feature_loss if isinstance(feature_loss, torch.Tensor) else torch.tensor(feature_loss, device=predictions.device))
         
         # 2. 物理损失
         pred_power = predictions[..., 0] if predictions.dim() > 2 else predictions
+
+        # 基于真实功率与物理基线偏差的动态掩码，避免限电/脏数据误触发物理惩罚
+        with torch.no_grad():
+            baseline = self.physical_layer.physics_loss.power_curve_baseline(wind_speed.flatten())
+            floor = self.config.physics_mask_floor * self.config.rated_power
+            deviation = (target_power.flatten() - baseline).abs()
+            ratio = deviation / (baseline.abs() + floor)
+            physics_mask = (ratio < self.config.physics_mask_threshold).float()
+
         physics_losses = self.physical_layer.physics_loss(
-            pred_power.flatten(), wind_speed.flatten()
+            pred_power.flatten(), wind_speed.flatten(), mask=physics_mask
         )
         physics_loss = physics_losses['total_physics']
 
