@@ -76,12 +76,12 @@
 
 ### 6. Wind-Agent模块 (`wind_agent.py`)
 - **KnowledgeBase**: 风电领域知识库，可重置与JSONL批量摄取
-- **ReasoningChain**: 思维链推理引擎，由真实LLM驱动（OpenAI / HuggingFace）
-- **RAGEngine**: 语义检索增强生成引擎（sentence-transformer优先，三元组编码回退）
-- **ReflectionAgent**: LLM+物理联合反思（结构化批注与修正建议）
+- **ReasoningChain**: 思维链推理引擎，由真实LLM驱动（OpenAI / HuggingFace），默认拒绝使用TemplateLLM假回显
+- **RAGEngine**: 语义检索增强生成引擎（sentence-transformer优先，TF-IDF三元组回退且无哈希碰撞）
+- **ReflectionAgent**: LLM+物理联合反思（数值/语义双通道批注与修正建议）
 - **WindAgent**: 完整智能体
 - **ReportGenerator**: 报告生成器
-- **Vector RAG**: 语义向量检索与动态文档摄取，替代静态关键词匹配；TemplateLLM仅作回显警示
+- **Vector RAG**: 语义向量检索与动态文档摄取，替代静态关键词匹配；TemplateLLM仅在显式允许时作占位警示
 
 ### 7. CCP框架 (`ccp_framework.py`)
 - **CCPConfig**: 系统配置
@@ -170,7 +170,7 @@ print(f"Test RMSE: {result['metrics']['rmse']:.4f}")
 ### Wind-Agent: LLM与RAG配置
 
 ```bash
-# 选择LLM后端（默认使用OpenAI，需要提供OPENAI_API_KEY）
+# 选择LLM后端（必须提供真实LLM，默认会拒绝TemplateLLM回显）
 export WIND_AGENT_LLM=openai
 export OPENAI_API_KEY=sk-...
 # 或使用本地Transformers模型
@@ -181,7 +181,8 @@ export OPENAI_API_KEY=sk-...
 ```python
 from wind_agent import WindAgent, PredictionContext
 
-agent = WindAgent()  # 自动根据环境变量选择LLM；若缺失则警告并使用TemplateLLM回显
+# 默认强制真实LLM；若要在无LLM环境下调试，可显式 allow_template_llm=True
+agent = WindAgent(allow_template_llm=False, conversation_max_turns=12)
 
 # 动态摄取知识库（外部JSONL日志或工单）
 agent.knowledge_base.load_jsonl("om_logs.jsonl", namespace="om")
@@ -191,11 +192,12 @@ context = PredictionContext(
     wind_direction=240,
     temperature=12.0,
     pressure=101.2,
+    historical_power=[0.8, 0.9, 1.0, 1.1, 1.0, 0.95],
 )
 result = agent.predict_with_explanation(context)
 print(agent.generate_report(context, result))
 
-# 面向对话的问答（支持多轮对话历史与检索证据）
+# 面向对话的问答（滑动窗口保留最近多轮对话历史与检索证据）
 print(agent.answer_question("为什么这次预测置信度较低？", context, result))
 ```
 

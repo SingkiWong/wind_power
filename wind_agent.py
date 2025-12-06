@@ -96,12 +96,14 @@ class LLMClient:
 
 
 class TemplateLLM(LLMClient):
-    """A deterministic emergency fallback.
+    """Minimal stub used only when explicitly allowed.
 
-    This class should *not* be used for production reasoning. It is kept only so
-    demo scripts do not crash when no external LLM is configured. A warning is
-    emitted at call time to encourage wiring a real backend.
+    The class now *refuses* to run unless callers opt-in. This prevents silent
+    regressions where the agent pretends to reason while merely echoing input.
     """
+
+    def __init__(self, allow: bool = False):
+        self.allow = allow
 
     def _join_messages(self, messages: Sequence[ChatTurn]) -> str:
         return "\n".join(f"{m.role}: {m.content}" for m in messages)
@@ -114,9 +116,13 @@ class TemplateLLM(LLMClient):
         messages: Optional[Sequence[ChatTurn]] = None,
         max_tokens: int = 512,
     ) -> str:
+        if not self.allow:
+            raise RuntimeError(
+                "TemplateLLM is a stub and cannot be used for reasoning. Please configure a real LLM backend."
+            )
         history = self._join_messages(messages or [])
         system_prefix = f"系统: {system}\n" if system else ""
-        warning = "【警告】未配置真实LLM，使用TemplateLLM仅做回显。\n"
+        warning = "【警告】当前使用TemplateLLM，仅做占位用途。\n"
         return (
             f"{warning}{system_prefix}上下文:\n{prompt}\n"
             f"对话历史:\n{history}\n"
@@ -218,15 +224,19 @@ class VectorIndex:
     """Lightweight semantic index with pluggable encoder.
 
     If `sentence_transformers` is available, a multilingual embedding model is
-    used automatically. Otherwise, a character-level trigram encoder is used as a
-    deterministic fallback (better than keyword exact match but still limited).
+    used automatically. Otherwise, a TF-IDF trigram encoder (no hashing/modulo)
+    is used as a deterministic fallback to preserve basic semantic grouping and
+    avoid random collisions.
     """
 
     def __init__(self, dim: int = 384, embedding_fn: Optional[Callable[[str], torch.Tensor]] = None):
         self.dim = dim
-        self.embedding_fn = embedding_fn or self._build_encoder()
         self.vectors: List[torch.Tensor] = []
         self.metadata: List[Dict] = []
+        self.vocab: Dict[str, int] = {}
+        self.doc_freq: Dict[str, int] = {}
+        self.num_docs = 0
+        self.embedding_fn = embedding_fn or self._build_encoder()
 
     def _build_encoder(self) -> Callable[[str], torch.Tensor]:
         try:
@@ -241,29 +251,76 @@ class VectorIndex:
 
             return encode
         except Exception:
-            vocab = {}
-
-            def encode(text: str) -> torch.Tensor:
-                vec = torch.zeros(self.dim)
+            # TF-IDF trigram encoder without hashing collisions.
+            def encode(text: str, *, update_vocab: bool = False) -> torch.Tensor:
+                tokens: List[str] = []
                 lowered = text.lower().replace(" ", "")
                 for i in range(len(lowered) - 2):
-                    tri = lowered[i : i + 3]
-                    idx = vocab.setdefault(tri, len(vocab) % self.dim)
-                    vec[idx] += 1.0
+                    tokens.append(lowered[i : i + 3])
+                if update_vocab:
+                    for tok in tokens:
+                        if tok not in self.vocab:
+                            self.vocab[tok] = len(self.vocab)
+                indices = [self.vocab.get(tok) for tok in tokens if tok in self.vocab]
+                if not indices:
+                    return torch.zeros(len(self.vocab) or 1)
+                vec = torch.zeros(len(self.vocab))
+                counts: Dict[int, int] = {}
+                for idx in indices:
+                    if idx is None:
+                        continue
+                    counts[idx] = counts.get(idx, 0) + 1
+                for idx, cnt in counts.items():
+                    term = list(self.vocab.keys())[idx]
+                    df = self.doc_freq.get(term, 0) if self.num_docs > 0 else 0
+                    idf = torch.log(torch.tensor((self.num_docs + 1) / (df + 1))) + 1.0
+                    vec[idx] = (cnt / len(tokens)) * idf
                 return F.normalize(vec, dim=0) if vec.norm() > 0 else vec
 
+            self._tfidf_encode = encode  # type: ignore[attr-defined]
             return encode
 
     def add(self, doc: Dict):
         content = doc.get("content", "") + " " + doc.get("title", "")
-        embedding = self.embedding_fn(content)
-        self.vectors.append(embedding)
+        if hasattr(self, "_tfidf_encode"):
+            tokens = []
+            lowered = content.lower().replace(" ", "")
+            for i in range(len(lowered) - 2):
+                tokens.append(lowered[i : i + 3])
+            unique_tokens = set(tokens)
+            for tok in unique_tokens:
+                if tok not in self.vocab:
+                    self.vocab[tok] = len(self.vocab)
+            for tok in unique_tokens:
+                self.doc_freq[tok] = self.doc_freq.get(tok, 0) + 1
+            self.num_docs += 1
+            embedding = self._tfidf_encode(content, update_vocab=False)
+            if embedding.size(0) > 0 and self.vectors:
+                pad = embedding.size(0) - self.vectors[0].size(0)
+                if pad > 0:
+                    self.vectors = [F.pad(v, (0, pad)) for v in self.vectors]
+            if embedding.numel() == 0:
+                embedding = torch.zeros(len(self.vocab) or 1)
+        else:
+            embedding = self.embedding_fn(content)
+        self.vectors.append(F.normalize(embedding, dim=0) if embedding.norm() > 0 else embedding)
         self.metadata.append(doc)
 
     def search(self, query: str, top_k: int = 3) -> List[Dict]:
         if not self.metadata:
             return []
-        query_vec = self.embedding_fn(query)
+        if hasattr(self, "_tfidf_encode"):
+            query_vec = self._tfidf_encode(query, update_vocab=False)
+            if query_vec.numel() == 0:
+                return []
+            if query_vec.size(0) != self.vectors[0].size(0):
+                pad = query_vec.size(0) - self.vectors[0].size(0)
+                if pad > 0:
+                    self.vectors = [F.pad(v, (0, pad)) for v in self.vectors]
+                elif pad < 0:
+                    query_vec = F.pad(query_vec, (0, -pad))
+        else:
+            query_vec = self.embedding_fn(query)
         matrix = torch.stack(self.vectors)
         scores = torch.mv(matrix, query_vec)
         topk = torch.topk(scores, k=min(top_k, scores.numel())).indices.tolist()
@@ -406,8 +463,32 @@ class ReflectionAgent:
                 corrections.append({"type": "scale", "factor": 0.85})
         return criticisms, corrections
 
+    def _semantic_checks(self, context: PredictionContext, evidence: List[Dict]) -> Tuple[List[str], List[Dict[str, Any]], str]:
+        trend = ", ".join(f"{p:.2f}" for p in context.historical_power[-6:]) or "无"
+        evidence_snippets = "\n".join(
+            f"- {doc.get('title', doc.get('id', 'doc'))}: {doc.get('content', '')[:160]}"
+            for doc in evidence
+        ) or "- 无"
+        prompt = (
+            "请作为专家审查以下预测是否符合趋势和物理直觉，输出JSON: "
+            "{\"criticisms\":[], \"corrections\":[], \"confidence_penalty\":0, \"commentary\":\"\"}.\n"
+            f"历史功率序列(近6条): {trend}\n"
+            f"当前预测功率: {context.predicted_power:.2f}MW, 风速 {context.wind_speed:.1f}m/s\n"
+            f"检索证据:\n{evidence_snippets}"
+        )
+        raw = self.llm.generate(prompt, system="语义一致性审查", max_tokens=320)
+        try:
+            parsed = json.loads(raw)
+            criticisms = [c for c in parsed.get("criticisms", []) if isinstance(c, str)]
+            corrections = [c for c in parsed.get("corrections", []) if isinstance(c, dict)]
+            commentary = parsed.get("commentary", raw)
+        except Exception:
+            criticisms, corrections, commentary = ["语义审查解析失败，使用原始文本"], [], raw
+        return criticisms, corrections, commentary
+
     def reflect(self, context: PredictionContext, evidence: List[Dict]) -> Dict[str, Any]:
         numeric_criticisms, corrections = self._numeric_checks(context)
+        semantic_criticisms, semantic_corrections, semantic_commentary = self._semantic_checks(context, evidence)
         evidence_snippets = "\n".join(
             f"- {doc.get('title', doc.get('id', 'doc'))}: {doc.get('content', '')[:160]}"
             for doc in evidence
@@ -433,9 +514,16 @@ class ReflectionAgent:
             critique_text = parsed.get("explanation", critique_raw)
         except Exception:
             critique_text = critique_raw
-        merged_corrections = corrections + self._sanitize_corrections(llm_corrections)
-        merged_criticisms = list(dict.fromkeys(numeric_criticisms + llm_criticisms))
+        merged_corrections = (
+            corrections
+            + self._sanitize_corrections(llm_corrections)
+            + self._sanitize_corrections(semantic_corrections)
+        )
+        merged_criticisms = list(
+            dict.fromkeys(numeric_criticisms + llm_criticisms + semantic_criticisms)
+        )
         score = max(0, 100 - 10 * len(numeric_criticisms) - int(confidence_penalty))
+        critique_text = f"{critique_text}\n[语义审查]\n{semantic_commentary}" if semantic_commentary else critique_text
         return {
             "criticisms": merged_criticisms,
             "llm_feedback": critique_text,
@@ -484,6 +572,10 @@ class WindAgent:
         rated_power: float = 2.0,
         llm: Optional[LLMClient] = None,
         embedding_fn: Optional[Callable[[str], torch.Tensor]] = None,
+        *,
+        allow_template_llm: bool = False,
+        allow_physics_fallback: bool = False,
+        conversation_max_turns: int = 12,
     ):
         self.prediction_model = prediction_model
         if llm is not None:
@@ -491,16 +583,27 @@ class WindAgent:
         else:
             try:
                 self.llm = resolve_llm_from_env()
-            except Exception:
-                self.llm = TemplateLLM()
+            except Exception as exc:
+                if allow_template_llm:
+                    self.llm = TemplateLLM(allow=True)
+                else:
+                    raise RuntimeError(
+                        "未配置真实LLM，请设置OPENAI_API_KEY或提供Transformers模型，或显式允许 TemplateLLM。"
+                    ) from exc
         self.knowledge_base = KnowledgeBase(embedding_fn=embedding_fn)
         self.cot = ChainOfThought(self.llm)
         self.reflector = ReflectionAgent(self.llm, rated_power)
         self.rated_power = rated_power
+        self.allow_physics_fallback = allow_physics_fallback
         self.conversation_history: List[ChatTurn] = []
+        self.conversation_max_turns = max(4, conversation_max_turns)
 
     def _model_predict(self, context: PredictionContext, wake_info: Optional[Dict]) -> float:
         if self.prediction_model is None:
+            if not self.allow_physics_fallback:
+                raise RuntimeError(
+                    "prediction_model 未注入且未允许物理回退；请提供模型或设置 allow_physics_fallback=True"
+                )
             if context.wind_speed < 3 or context.wind_speed >= 25:
                 base = 0.0
             elif context.wind_speed < 12:
@@ -554,6 +657,7 @@ class WindAgent:
         prediction_result: Optional[PredictionResult] = None,
     ) -> str:
         self.conversation_history.append(ChatTurn(role="user", content=question))
+        self._prune_history()
         evidence = self.knowledge_base.search(question)
         context_prompt = context.to_prompt() if context else "无上下文"
         result_prompt = (
@@ -563,11 +667,15 @@ class WindAgent:
             if prediction_result
             else "尚未执行预测"
         )
+        evidence_prompt = "\n".join(
+            f"- {doc.get('id', 'doc')} | {doc.get('title', doc.get('fault_type', 'N/A'))}: {doc.get('content', '')[:160]}"
+            for doc in evidence
+        ) or "- 无"
         prompt = (
             f"问题: {question}\n"
             f"上下文:\n{context_prompt}\n"
             f"预测结果:\n{result_prompt}\n"
-            f"检索证据:\n{json.dumps(evidence, ensure_ascii=False)[:800]}\n"
+            f"检索证据:\n{evidence_prompt}\n"
         )
         answer = self.llm.generate(
             prompt,
@@ -576,6 +684,7 @@ class WindAgent:
             max_tokens=640,
         )
         self.conversation_history.append(ChatTurn(role="assistant", content=answer))
+        self._prune_history()
         return answer
 
     def interactive_query(self, question: str, context: PredictionContext) -> str:
@@ -604,6 +713,11 @@ class WindAgent:
             f"警告信息:\n{warnings}\n"
             "========================================\n"
         )
+
+    def _prune_history(self):
+        if len(self.conversation_history) <= self.conversation_max_turns:
+            return
+        self.conversation_history = self.conversation_history[-self.conversation_max_turns :]
 
 
 if __name__ == "__main__":
