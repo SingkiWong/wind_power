@@ -75,13 +75,13 @@
 - **RevIN**: 可逆实例归一化
 
 ### 6. Wind-Agent模块 (`wind_agent.py`)
-- **KnowledgeBase**: 风电领域知识库
-- **ReasoningChain**: 思维链推理引擎
-- **RAGEngine**: 检索增强生成引擎
-- **ReflectionAgent**: 反思智能体（预测-反思-修正闭环）
+- **KnowledgeBase**: 风电领域知识库，可重置与JSONL批量摄取
+- **ReasoningChain**: 思维链推理引擎，由真实LLM驱动（OpenAI / HuggingFace）
+- **RAGEngine**: 语义检索增强生成引擎（sentence-transformer优先，三元组编码回退）
+- **ReflectionAgent**: LLM+物理联合反思（结构化批注与修正建议）
 - **WindAgent**: 完整智能体
 - **ReportGenerator**: 报告生成器
-- **Vector RAG**: 语义向量检索与动态文档摄取，替代静态关键词匹配
+- **Vector RAG**: 语义向量检索与动态文档摄取，替代静态关键词匹配；TemplateLLM仅作回显警示
 
 ### 7. CCP框架 (`ccp_framework.py`)
 - **CCPConfig**: 系统配置
@@ -103,6 +103,8 @@
 
 ```bash
 pip install torch numpy scipy einops
+# LLM / RAG 可选依赖
+# pip install openai transformers sentence-transformers
 ```
 
 ### 基础使用
@@ -163,6 +165,38 @@ result = run_experiment(
 )
 
 print(f"Test RMSE: {result['metrics']['rmse']:.4f}")
+```
+
+### Wind-Agent: LLM与RAG配置
+
+```bash
+# 选择LLM后端（默认使用OpenAI，需要提供OPENAI_API_KEY）
+export WIND_AGENT_LLM=openai
+export OPENAI_API_KEY=sk-...
+# 或使用本地Transformers模型
+# export WIND_AGENT_LLM=transformers
+# export WIND_AGENT_LLM_MODEL=Qwen/Qwen2.5-0.5B
+```
+
+```python
+from wind_agent import WindAgent, PredictionContext
+
+agent = WindAgent()  # 自动根据环境变量选择LLM；若缺失则警告并使用TemplateLLM回显
+
+# 动态摄取知识库（外部JSONL日志或工单）
+agent.knowledge_base.load_jsonl("om_logs.jsonl", namespace="om")
+
+context = PredictionContext(
+    wind_speed=9.5,
+    wind_direction=240,
+    temperature=12.0,
+    pressure=101.2,
+)
+result = agent.predict_with_explanation(context)
+print(agent.generate_report(context, result))
+
+# 面向对话的问答（支持多轮对话历史与检索证据）
+print(agent.answer_question("为什么这次预测置信度较低？", context, result))
 ```
 
 ## 核心创新点
