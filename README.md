@@ -185,8 +185,11 @@ export WIND_AGENT_LLM_MODEL=/path/to/local/llm
 ```python
 from wind_agent import WindAgent, PredictionContext
 
-# 默认强制真实LLM；若要在无LLM环境下调试，可显式 allow_template_llm=True
-agent = WindAgent(allow_template_llm=False, conversation_max_turns=12)
+# 默认强制真实LLM；未注入预测模型会抛错，除非显式开启 allow_physics_fallback
+agent = WindAgent(conversation_max_turns=12, allow_physics_fallback=False)
+
+# 关键指令（语言、风险偏好等）注册为会话级指令，滑动窗口不会丢弃
+agent.register_session_directive("请始终用中文回答，并明确不确定性来源。")
 
 # 动态摄取知识库（外部JSONL日志或工单）
 agent.knowledge_base.load_jsonl("om_logs.jsonl", namespace="om")

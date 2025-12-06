@@ -464,15 +464,20 @@ class ChainOfThought:
         return [step.strip() for step in reasoning_text.split("\n") if step.strip()]
 
 
-class ReflectionAgent:
-    def __init__(self, llm: LLMClient, rated_power: float = 2.0):
-        self.llm = llm
-        self.rated_power = rated_power
-        self.cut_in = 3.0
-        self.cut_out = 25.0
-        self.rated_speed = 12.0
+class SafetyGuardrails:
+    """Hard-coded numeric guardrails kept separate from LLM critique.
 
-    def _numeric_checks(self, context: PredictionContext) -> Tuple[List[str], List[Dict]]:
+    This keeps deterministic protections explicit while allowing the reflection
+    stage to focus on softer, semantic feedback.
+    """
+
+    def __init__(self, rated_power: float = 2.0, cut_in: float = 3.0, cut_out: float = 25.0, rated_speed: float = 12.0):
+        self.rated_power = rated_power
+        self.cut_in = cut_in
+        self.cut_out = cut_out
+        self.rated_speed = rated_speed
+
+    def evaluate(self, context: PredictionContext) -> Tuple[List[str], List[Dict]]:
         criticisms: List[str] = []
         corrections: List[Dict] = []
         ws = context.wind_speed
@@ -494,6 +499,18 @@ class ReflectionAgent:
                 criticisms.append("爬坡区预测偏高，超过理论值30%")
                 corrections.append({"type": "scale", "factor": 0.85})
         return criticisms, corrections
+
+
+class ReflectionAgent:
+    def __init__(self, llm: LLMClient, rated_power: float = 2.0):
+        self.llm = llm
+        self.guardrails = SafetyGuardrails(rated_power=rated_power)
+        self.rated_power = rated_power
+
+    def _numeric_checks(self, context: PredictionContext) -> Tuple[List[str], List[Dict]]:
+        """Backward-compatible shim around SafetyGuardrails."""
+
+        return self.guardrails.evaluate(context)
 
     def _semantic_checks(self, context: PredictionContext, evidence: List[Dict]) -> Tuple[List[str], List[Dict[str, Any]], str]:
         trend = ", ".join(f"{p:.2f}" for p in context.historical_power[-6:]) or "无"
@@ -636,15 +653,26 @@ class WindAgent:
         ]
         self.feature_extractor = feature_extractor
         self.conversation_history: List[ChatTurn] = []
+        self.session_directives: List[ChatTurn] = []
         self.conversation_max_turns = max(4, conversation_max_turns)
         self.conversation_max_chars = max(2000, conversation_max_chars)
 
-    def _model_predict(self, context: PredictionContext, wake_info: Optional[Dict]) -> float:
+    def register_session_directive(self, content: str, *, role: str = "system") -> None:
+        """Register a sticky directive that is always injected into prompts.
+
+        Use this to keep初始安全/风场限定条件在长对话中不被滑动窗口丢弃。
+        """
+
+        self.session_directives.append(ChatTurn(role=role, content=content))
+
+    def _model_predict(self, context: PredictionContext, wake_info: Optional[Dict]) -> Tuple[float, List[str]]:
+        warnings: List[str] = []
         if self.prediction_model is None:
             if not self.allow_physics_fallback:
                 raise RuntimeError(
                     "prediction_model 未注入且未允许物理回退；请提供模型或设置 allow_physics_fallback=True"
                 )
+            warnings.append("未注入预测模型，使用物理功率曲线回退计算结果")
             if context.wind_speed < 3 or context.wind_speed >= 25:
                 base = 0.0
             elif context.wind_speed < 12:
@@ -669,7 +697,7 @@ class WindAgent:
             base = float(self.prediction_model(inputs).squeeze().item())
         if wake_info and wake_info.get("wake_loss", 0) > 0:
             base *= 1 - wake_info["wake_loss"]
-        return base
+        return base, warnings
 
     def predict_with_explanation(
         self, context: PredictionContext, wake_info: Optional[Dict] = None
@@ -677,7 +705,7 @@ class WindAgent:
         evidence = self.knowledge_base.search(
             f"风速{context.wind_speed} 风向{context.wind_direction} 功率预测"
         )
-        raw_prediction = self._model_predict(context, wake_info)
+        raw_prediction, predict_warnings = self._model_predict(context, wake_info)
         context.predicted_power = raw_prediction
         reasoning_chain = self.cot.generate(context, raw_prediction, evidence)
         reflection = self.reflector.reflect(context, evidence)
@@ -686,7 +714,7 @@ class WindAgent:
             if reflection["needs_refinement"]
             else raw_prediction
         )
-        warnings = reflection["criticisms"]
+        warnings = list(dict.fromkeys(predict_warnings + reflection["criticisms"]))
         narrative = reflection["llm_feedback"]
         confidence = 0.9 if not warnings else 0.7
         context.confidence = confidence
@@ -730,7 +758,7 @@ class WindAgent:
         answer = self.llm.generate(
             prompt,
             system="风电场智能助理，参考对话历史回答，必要时指出不确定性。",
-            messages=self.conversation_history,
+            messages=[*self.session_directives, *self.conversation_history],
             max_tokens=640,
         )
         self.conversation_history.append(ChatTurn(role="assistant", content=answer))
