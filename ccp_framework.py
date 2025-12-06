@@ -258,7 +258,7 @@ class CausalReasoningLayer(nn.Module):
         鼓励模型的注意力模式与发现的因果关系一致
         """
         if attention_weights is None:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=causal_graph.device)
         
         # 平均注意力头
         avg_attn = attention_weights.mean(dim=1)  # [batch, seq, seq]
@@ -276,8 +276,52 @@ class CausalReasoningLayer(nn.Module):
             causal_flat,
             reduction='batchmean'
         )
-        
+
         return consistency_loss
+
+    def prepare_causal_graph(
+        self,
+        causal_graph: Any,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32
+    ) -> torch.Tensor:
+        """Ensure causal graphs are tensors on the right device/dtype.
+
+        Handles numpy arrays and CPU tensors by moving them to the target device
+        before any normalization or loss computation, preventing device mismatch
+        errors during training and evaluation.
+        """
+        if isinstance(causal_graph, np.ndarray):
+            causal_graph = torch.from_numpy(causal_graph)
+
+        if not isinstance(causal_graph, torch.Tensor):
+            raise TypeError("causal_graph must be a torch.Tensor or numpy.ndarray")
+
+        if causal_graph.dtype != dtype:
+            causal_graph = causal_graph.to(dtype)
+
+        if causal_graph.device != device:
+            causal_graph = causal_graph.to(device)
+
+        return causal_graph
+
+    def normalize_causal_graph(self, causal_graph: torch.Tensor) -> torch.Tensor:
+        """
+        标准化因果图以便与注意力矩阵对齐。
+
+        通过最小-最大归一化让边权落在[0,1]区间，避免梯度爆炸，
+        同时保持结构稀疏性。
+        """
+        if causal_graph.numel() == 0:
+            return causal_graph
+
+        min_val = causal_graph.min()
+        max_val = causal_graph.max()
+        if (max_val - min_val) < 1e-8:
+            return torch.zeros_like(causal_graph)
+
+        normed = (causal_graph - min_val) / (max_val - min_val)
+        return normed
 
 
 class CognitiveInterfaceLayer:
@@ -426,28 +470,36 @@ class CCPSystem(nn.Module):
             pred_power.flatten(), wind_speed.flatten()
         )
         physics_loss = physics_losses['total_physics']
-        
+
         # 3. 因果一致性损失
         causal_loss = torch.tensor(0.0, device=predictions.device)
         if causal_graph is not None and 'attention' in outputs:
-            causal_loss = self.causal_layer.compute_causal_consistency_loss(
-                outputs['attention'], causal_graph
+            prepared_graph = self.causal_layer.prepare_causal_graph(
+                causal_graph, device=predictions.device
             )
-        
+            normalized_graph = self.causal_layer.normalize_causal_graph(prepared_graph)
+            causal_loss = self.causal_layer.compute_causal_consistency_loss(
+                outputs['attention'], normalized_graph
+            )
+
         # 总损失
         total_loss = (
-            data_loss + 
+            data_loss +
             self.config.lambda_physics * physics_loss +
             self.config.lambda_causal * causal_loss
         )
-        
+
+        # 物理一致性分数（越接近1越好）
+        physics_consistency = torch.exp(-physics_loss.detach())
+
         loss_dict = {
             'total': total_loss.item(),
             'data': data_loss.item(),
             'physics': physics_loss.item(),
+            'physics_consistency': physics_consistency.item(),
             'causal': causal_loss.item() if isinstance(causal_loss, torch.Tensor) else causal_loss
         }
-        
+
         return total_loss, loss_dict
     
     def predict_with_explanation(
@@ -469,29 +521,47 @@ class CCPSystem(nn.Module):
             outputs = self.forward(x, wind_direction, return_attention=True)
             predictions = outputs['predictions']
             confidence = outputs['confidence']
-            
+            attention = outputs.get('attention')
+
+            # 计算物理一致性分数
+            pred_power = predictions[..., 0] if predictions.dim() > 2 else predictions
+            physics_losses = self.physical_layer.physics_loss(
+                pred_power.flatten(), wind_speed.flatten()
+            )
+            physics_consistency = torch.exp(-physics_losses['total_physics'])
+
         # 2. 创建上下文
         contexts = []
         batch_size = x.shape[0]
-        
+
         for i in range(min(batch_size, len(turbine_ids))):
             # 取预测的最后一个时间步的功率
             pred_power = predictions[i, -1, 0].item() if predictions.dim() > 2 else predictions[i, -1].item()
-            
+
+            causal_info = None
+            if attention is not None:
+                # 使用平均注意力作为因果强度近似
+                avg_attn = attention[i].mean(dim=0)
+                causal_info = {
+                    'attention_graph': self.causal_layer.normalize_causal_graph(avg_attn).cpu()
+                }
+
             ctx = self.cognitive_layer.create_context(
                 turbine_id=turbine_ids[i],
                 predicted_power=max(0, pred_power),  # 确保非负
                 confidence=confidence[i].item(),
                 wind_speed=wind_speed[i].mean().item(),
-                wind_direction=wind_direction[i].item() if wind_direction.dim() > 0 else wind_direction.item()
+                wind_direction=wind_direction[i].item() if wind_direction.dim() > 0 else wind_direction.item(),
+                causal_info=causal_info
             )
             contexts.append(ctx)
-        
+
         # 3. 生成解释和报告
         result = {
             'predictions': predictions,
             'confidence': confidence,
-            'contexts': contexts
+            'contexts': contexts,
+            'physics_consistency': physics_consistency.cpu()
         }
         
         if generate_report:

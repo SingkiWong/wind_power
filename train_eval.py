@@ -173,18 +173,28 @@ class Trainer:
             y = batch['y'].to(self.device)
             wind_speed = batch['wind_speed'].to(self.device)
             wind_direction = batch['wind_direction'].to(self.device)
-            
+            causal_graph = batch.get('causal_graph')
+
             # 扩展wind_speed到序列长度
             if wind_speed.dim() == 1:
                 wind_speed = wind_speed.unsqueeze(1).expand(-1, y.shape[1])
-            
+
             # 前向传播
             self.optimizer.zero_grad()
-            outputs = self.model(x, wind_direction)
-            
+            outputs = self.model(
+                x,
+                wind_direction,
+                return_attention=causal_graph is not None
+            )
+
             # 计算损失
-            loss, loss_dict = self.model.compute_loss(outputs, y, wind_speed)
-            
+            loss, loss_dict = self.model.compute_loss(
+                outputs,
+                y,
+                wind_speed,
+                causal_graph=causal_graph
+            )
+
             # 反向传播
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -211,18 +221,28 @@ class Trainer:
         total_loss = 0
         all_preds = []
         all_targets = []
-        
+
         for batch in self.val_loader:
             x = batch['x'].to(self.device)
             y = batch['y'].to(self.device)
             wind_speed = batch['wind_speed'].to(self.device)
             wind_direction = batch['wind_direction'].to(self.device)
-            
+            causal_graph = batch.get('causal_graph')
+
             if wind_speed.dim() == 1:
                 wind_speed = wind_speed.unsqueeze(1).expand(-1, y.shape[1])
-            
-            outputs = self.model(x, wind_direction)
-            loss, _ = self.model.compute_loss(outputs, y, wind_speed)
+
+            outputs = self.model(
+                x,
+                wind_direction,
+                return_attention=causal_graph is not None
+            )
+            loss, _ = self.model.compute_loss(
+                outputs,
+                y,
+                wind_speed,
+                causal_graph=causal_graph
+            )
             
             total_loss += loss.item()
             all_preds.append(outputs['predictions'].cpu())
