@@ -96,17 +96,11 @@ class LLMClient:
 
 
 class TemplateLLM(LLMClient):
-    """Minimal stub used only when explicitly allowed.
+    """Hard-stop stub to prevent fake reasoning.
 
-    The class now *refuses* to run unless callers opt-in. This prevents silent
-    regressions where the agent pretends to reason while merely echoing input.
+    The previous echo-style implementation is removed entirely so that missing
+    LLM wiring fails fast instead of silently polluting downstream logic.
     """
-
-    def __init__(self, allow: bool = False):
-        self.allow = allow
-
-    def _join_messages(self, messages: Sequence[ChatTurn]) -> str:
-        return "\n".join(f"{m.role}: {m.content}" for m in messages)
 
     def generate(
         self,
@@ -116,18 +110,9 @@ class TemplateLLM(LLMClient):
         messages: Optional[Sequence[ChatTurn]] = None,
         max_tokens: int = 512,
     ) -> str:
-        if not self.allow:
-            raise RuntimeError(
-                "TemplateLLM is a stub and cannot be used for reasoning. Please configure a real LLM backend."
-            )
-        history = self._join_messages(messages or [])
-        system_prefix = f"系统: {system}\n" if system else ""
-        warning = "【警告】当前使用TemplateLLM，仅做占位用途。\n"
-        return (
-            f"{warning}{system_prefix}上下文:\n{prompt}\n"
-            f"对话历史:\n{history}\n"
-            "请接入真实LLM以获得有意义的推理。"
-        )[: max_tokens * 4]
+        raise RuntimeError(
+            "TemplateLLM is disabled. Configure a real LLM backend (Transformers or OpenAI-compatible) before use."
+        )
 
 
 class OpenAIChatLLM(LLMClient):
@@ -251,6 +236,9 @@ class VectorIndex:
         self.vocab: Dict[str, int] = {}
         self.doc_freq: Dict[str, int] = {}
         self.num_docs = 0
+        self._sklearn_vectorizer = None
+        self._sklearn_corpus: List[str] = []
+        self._encoder_type = "custom"
         self.embedding_fn = embedding_fn or self._build_encoder()
 
     def _build_encoder(self) -> Callable[[str], torch.Tensor]:
@@ -258,6 +246,7 @@ class VectorIndex:
             from sentence_transformers import SentenceTransformer  # type: ignore
 
             model = SentenceTransformer("BAAI/bge-m3")
+            self._encoder_type = "sentence_transformers"
 
             def encode(text: str) -> torch.Tensor:
                 with torch.inference_mode():
@@ -266,37 +255,60 @@ class VectorIndex:
 
             return encode
         except Exception:
-            # TF-IDF trigram encoder without hashing collisions.
-            def encode(text: str, *, update_vocab: bool = False) -> torch.Tensor:
-                tokens: List[str] = []
-                lowered = text.lower().replace(" ", "")
-                for i in range(len(lowered) - 2):
-                    tokens.append(lowered[i : i + 3])
-                if update_vocab:
-                    for tok in tokens:
-                        if tok not in self.vocab:
-                            self.vocab[tok] = len(self.vocab)
-                indices = [self.vocab.get(tok) for tok in tokens if tok in self.vocab]
-                if not indices:
-                    return torch.zeros(len(self.vocab) or 1)
-                vec = torch.zeros(len(self.vocab))
-                counts: Dict[int, int] = {}
-                for idx in indices:
-                    if idx is None:
-                        continue
-                    counts[idx] = counts.get(idx, 0) + 1
-                for idx, cnt in counts.items():
-                    term = list(self.vocab.keys())[idx]
-                    df = self.doc_freq.get(term, 0) if self.num_docs > 0 else 0
-                    idf = torch.log(torch.tensor((self.num_docs + 1) / (df + 1))) + 1.0
-                    vec[idx] = (cnt / len(tokens)) * idf
-                return F.normalize(vec, dim=0) if vec.norm() > 0 else vec
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
 
-            self._tfidf_encode = encode  # type: ignore[attr-defined]
-            return encode
+                self._encoder_type = "sklearn_tfidf"
+                self._sklearn_vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(1, 3), min_df=1)
+
+                def encode(text: str) -> torch.Tensor:
+                    if self._sklearn_vectorizer is None:
+                        return torch.zeros(1)
+                    matrix = self._sklearn_vectorizer.transform([text]) if self._sklearn_vectorizer.vocabulary_ else self._sklearn_vectorizer.fit_transform([text])
+                    dense = torch.tensor(matrix.toarray()[0], dtype=torch.float)
+                    return F.normalize(dense, dim=0) if dense.norm() > 0 else dense
+
+                return encode
+            except Exception:
+                # TF-IDF trigram encoder without hashing collisions.
+                def encode(text: str, *, update_vocab: bool = False) -> torch.Tensor:
+                    tokens: List[str] = []
+                    lowered = text.lower().replace(" ", "")
+                    for i in range(len(lowered) - 2):
+                        tokens.append(lowered[i : i + 3])
+                    if update_vocab:
+                        for tok in tokens:
+                            if tok not in self.vocab:
+                                self.vocab[tok] = len(self.vocab)
+                    indices = [self.vocab.get(tok) for tok in tokens if tok in self.vocab]
+                    if not indices:
+                        return torch.zeros(len(self.vocab) or 1)
+                    vec = torch.zeros(len(self.vocab))
+                    counts: Dict[int, int] = {}
+                    for idx in indices:
+                        if idx is None:
+                            continue
+                        counts[idx] = counts.get(idx, 0) + 1
+                    for idx, cnt in counts.items():
+                        term = list(self.vocab.keys())[idx]
+                        df = self.doc_freq.get(term, 0) if self.num_docs > 0 else 0
+                        idf = torch.log(torch.tensor((self.num_docs + 1) / (df + 1))) + 1.0
+                        vec[idx] = (cnt / len(tokens)) * idf
+                    return F.normalize(vec, dim=0) if vec.norm() > 0 else vec
+
+                self._tfidf_encode = encode  # type: ignore[attr-defined]
+                return encode
 
     def add(self, doc: Dict):
         content = doc.get("content", "") + " " + doc.get("title", "")
+        if self._encoder_type == "sklearn_tfidf" and self._sklearn_vectorizer is not None:
+            self._sklearn_corpus.append(content)
+            matrix = self._sklearn_vectorizer.fit_transform(self._sklearn_corpus)
+            dense = torch.tensor(matrix.toarray(), dtype=torch.float)
+            self.vectors = [F.normalize(row, dim=0) if row.norm() > 0 else row for row in dense]
+            self.metadata.append(doc)
+            return
+
         if hasattr(self, "_tfidf_encode"):
             tokens = []
             lowered = content.lower().replace(" ", "")
@@ -324,7 +336,12 @@ class VectorIndex:
     def search(self, query: str, top_k: int = 3) -> List[Dict]:
         if not self.metadata:
             return []
-        if hasattr(self, "_tfidf_encode"):
+        if self._encoder_type == "sklearn_tfidf" and self._sklearn_vectorizer is not None:
+            query_vec = torch.tensor(
+                self._sklearn_vectorizer.transform([query]).toarray()[0], dtype=torch.float
+            )
+            query_vec = F.normalize(query_vec, dim=0) if query_vec.norm() > 0 else query_vec
+        elif hasattr(self, "_tfidf_encode"):
             query_vec = self._tfidf_encode(query, update_vocab=False)
             if query_vec.numel() == 0:
                 return []
@@ -529,18 +546,20 @@ class ReflectionAgent:
             critique_text = parsed.get("explanation", critique_raw)
         except Exception:
             critique_text = critique_raw
+        hard_guardrails = list(dict.fromkeys(numeric_criticisms))
+        soft_criticisms = list(dict.fromkeys(llm_criticisms + semantic_criticisms))
         merged_corrections = (
             corrections
             + self._sanitize_corrections(llm_corrections)
             + self._sanitize_corrections(semantic_corrections)
         )
-        merged_criticisms = list(
-            dict.fromkeys(numeric_criticisms + llm_criticisms + semantic_criticisms)
-        )
+        merged_criticisms = hard_guardrails + [c for c in soft_criticisms if c not in hard_guardrails]
         score = max(0, 100 - 10 * len(numeric_criticisms) - int(confidence_penalty))
         critique_text = f"{critique_text}\n[语义审查]\n{semantic_commentary}" if semantic_commentary else critique_text
         return {
             "criticisms": merged_criticisms,
+            "hard_guardrails": hard_guardrails,
+            "soft_criticisms": soft_criticisms,
             "llm_feedback": critique_text,
             "corrections": merged_corrections,
             "physical_consistency_score": score,
@@ -588,9 +607,11 @@ class WindAgent:
         llm: Optional[LLMClient] = None,
         embedding_fn: Optional[Callable[[str], torch.Tensor]] = None,
         *,
-        allow_template_llm: bool = False,
         allow_physics_fallback: bool = False,
         conversation_max_turns: int = 12,
+        conversation_max_chars: int = 6000,
+        feature_keys: Optional[Sequence[str]] = None,
+        feature_extractor: Optional[Callable[[PredictionContext], torch.Tensor]] = None,
     ):
         self.prediction_model = prediction_model
         if llm is not None:
@@ -599,19 +620,24 @@ class WindAgent:
             try:
                 self.llm = resolve_llm_from_env()
             except Exception as exc:
-                if allow_template_llm:
-                    self.llm = TemplateLLM(allow=True)
-                else:
-                    raise RuntimeError(
-                        "未配置真实LLM，请设置OPENAI_API_KEY或提供Transformers模型，或显式允许 TemplateLLM。"
-                    ) from exc
+                raise RuntimeError(
+                    "未配置真实LLM，请设置 OPENAI_API_KEY 或提供本地 Transformers 模型 (WIND_AGENT_LLM=transformers)。"
+                ) from exc
         self.knowledge_base = KnowledgeBase(embedding_fn=embedding_fn)
         self.cot = ChainOfThought(self.llm)
         self.reflector = ReflectionAgent(self.llm, rated_power)
         self.rated_power = rated_power
         self.allow_physics_fallback = allow_physics_fallback
+        self.feature_keys = list(feature_keys) if feature_keys else [
+            "wind_speed",
+            "wind_direction",
+            "temperature",
+            "pressure",
+        ]
+        self.feature_extractor = feature_extractor
         self.conversation_history: List[ChatTurn] = []
         self.conversation_max_turns = max(4, conversation_max_turns)
+        self.conversation_max_chars = max(2000, conversation_max_chars)
 
     def _model_predict(self, context: PredictionContext, wake_info: Optional[Dict]) -> float:
         if self.prediction_model is None:
@@ -627,10 +653,19 @@ class WindAgent:
             else:
                 base = self.rated_power
         else:
-            inputs = torch.tensor(
-                [context.wind_speed, context.wind_direction, context.temperature, context.pressure],
-                dtype=torch.float,
-            ).unsqueeze(0)
+            if self.feature_extractor is not None:
+                features = self.feature_extractor(context)
+                if features.dim() == 1:
+                    features = features.unsqueeze(0)
+                inputs = features.to(dtype=torch.float)
+            else:
+                try:
+                    feature_values = [float(getattr(context, key)) for key in self.feature_keys]
+                except AttributeError as exc:
+                    raise ValueError(
+                        f"预测模型特征缺失，请确保上下文包含 {self.feature_keys}"
+                    ) from exc
+                inputs = torch.tensor(feature_values, dtype=torch.float).unsqueeze(0)
             base = float(self.prediction_model(inputs).squeeze().item())
         if wake_info and wake_info.get("wake_loss", 0) > 0:
             base *= 1 - wake_info["wake_loss"]
@@ -730,9 +765,15 @@ class WindAgent:
         )
 
     def _prune_history(self):
-        if len(self.conversation_history) <= self.conversation_max_turns:
-            return
-        self.conversation_history = self.conversation_history[-self.conversation_max_turns :]
+        # First bound by number of turns
+        if len(self.conversation_history) > self.conversation_max_turns:
+            self.conversation_history = self.conversation_history[-self.conversation_max_turns :]
+
+        # Then bound by character budget to avoid token explosions
+        total_chars = sum(len(turn.content) for turn in self.conversation_history)
+        while self.conversation_history and total_chars > self.conversation_max_chars:
+            removed = self.conversation_history.pop(0)
+            total_chars -= len(removed.content)
 
 
 if __name__ == "__main__":
