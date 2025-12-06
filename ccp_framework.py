@@ -52,6 +52,11 @@ class CCPConfig:
     # 训练配置
     lambda_physics: float = 0.1   # 物理损失权重
     lambda_causal: float = 0.05   # 因果一致性损失权重
+    # 动态权重与课程学习配置
+    loss_weighting: str = "static"   # "static" 或 "uncertainty"
+    curriculum_start_physics: int = 3  # 物理损失开始参与的epoch
+    curriculum_start_causal: int = 5   # 因果损失开始参与的epoch
+    curriculum_warmup_epochs: int = 3  # 从起始到完全权重的线性升温周期
     
     # 架构选择
     backbone: str = "mamba"       # 骨干网络: "mamba", "transformer", "ttm"
@@ -401,6 +406,16 @@ class CCPSystem(nn.Module):
         self.physical_layer = PhysicalPerceptionLayer(self.config)
         self.causal_layer = CausalReasoningLayer(self.config)
         self.cognitive_layer = CognitiveInterfaceLayer(self.config)
+
+        # 动态损失权重参数（不含梯度裁剪的开销）
+        if self.config.loss_weighting == "uncertainty":
+            self.loss_log_vars = nn.ParameterDict({
+                'data': nn.Parameter(torch.zeros(1)),
+                'physics': nn.Parameter(torch.zeros(1)),
+                'causal': nn.Parameter(torch.zeros(1)),
+            })
+        else:
+            self.loss_log_vars = None
         
         # 置信度估计网络
         self.confidence_net = nn.Sequential(
@@ -452,15 +467,27 @@ class CCPSystem(nn.Module):
         outputs: Dict[str, torch.Tensor],
         targets: torch.Tensor,
         wind_speed: torch.Tensor,
-        causal_graph: Optional[torch.Tensor] = None
+        causal_graph: Optional[torch.Tensor] = None,
+        current_epoch: Optional[int] = None
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         计算总损失
-        
+
         L_total = L_data + λ_phy * L_physics + λ_causal * L_causal
         """
         predictions = outputs['predictions']
-        
+
+        physics_weight = self._compute_curriculum_weight(
+            self.config.lambda_physics,
+            current_epoch,
+            self.config.curriculum_start_physics
+        )
+        causal_weight = self._compute_curriculum_weight(
+            self.config.lambda_causal,
+            current_epoch,
+            self.config.curriculum_start_causal
+        )
+
         # 1. 数据损失 (MSE)
         data_loss = F.mse_loss(predictions, targets)
         
@@ -482,12 +509,26 @@ class CCPSystem(nn.Module):
                 outputs['attention'], normalized_graph
             )
 
-        # 总损失
-        total_loss = (
-            data_loss +
-            self.config.lambda_physics * physics_loss +
-            self.config.lambda_causal * causal_loss
-        )
+        # 总损失（支持静态/不确定性动态权重）
+        if self.loss_log_vars is None:
+            total_loss = (
+                data_loss + physics_weight * physics_loss + causal_weight * causal_loss
+            )
+            effective_weights = {
+                'data': 1.0,
+                'physics': physics_weight,
+                'causal': causal_weight,
+            }
+        else:
+            weighted_data = torch.exp(-self.loss_log_vars['data']) * data_loss + self.loss_log_vars['data']
+            weighted_physics = torch.exp(-self.loss_log_vars['physics']) * (physics_weight * physics_loss) + self.loss_log_vars['physics']
+            weighted_causal = torch.exp(-self.loss_log_vars['causal']) * (causal_weight * causal_loss) + self.loss_log_vars['causal']
+            total_loss = 0.5 * (weighted_data + weighted_physics + weighted_causal)
+            effective_weights = {
+                'data': float(torch.exp(-self.loss_log_vars['data']).detach().cpu()),
+                'physics': float(torch.exp(-self.loss_log_vars['physics']).detach().cpu() * physics_weight),
+                'causal': float(torch.exp(-self.loss_log_vars['causal']).detach().cpu() * causal_weight),
+            }
 
         # 物理一致性分数（越接近1越好）
         physics_consistency = torch.exp(-physics_loss.detach())
@@ -497,10 +538,35 @@ class CCPSystem(nn.Module):
             'data': data_loss.item(),
             'physics': physics_loss.item(),
             'physics_consistency': physics_consistency.item(),
-            'causal': causal_loss.item() if isinstance(causal_loss, torch.Tensor) else causal_loss
+            'causal': causal_loss.item() if isinstance(causal_loss, torch.Tensor) else causal_loss,
+            'w_data': effective_weights['data'],
+            'w_physics': effective_weights['physics'],
+            'w_causal': effective_weights['causal'],
         }
 
         return total_loss, loss_dict
+
+    def _compute_curriculum_weight(
+        self,
+        base_weight: float,
+        current_epoch: Optional[int],
+        start_epoch: int
+    ) -> float:
+        """线性课程学习权重，在冷启动阶段抑制物理/因果损失。
+
+        Args:
+            base_weight: 静态基准权重（如 lambda_physics）
+            current_epoch: 当前epoch（从0开始）
+            start_epoch: 该损失开始介入的epoch
+        """
+        if current_epoch is None:
+            return base_weight
+        if current_epoch < start_epoch:
+            return 0.0
+
+        warmup = max(1, self.config.curriculum_warmup_epochs)
+        progress = min(1.0, (current_epoch - start_epoch + 1) / warmup)
+        return float(base_weight * progress)
     
     def predict_with_explanation(
         self,

@@ -160,7 +160,7 @@ class Trainer:
             'val_metrics': []
         }
     
-    def train_epoch(self) -> Dict[str, float]:
+    def train_epoch(self, current_epoch: Optional[int] = None) -> Dict[str, float]:
         """训练一个epoch"""
         self.model.train()
         total_loss = 0
@@ -192,7 +192,8 @@ class Trainer:
                 outputs,
                 y,
                 wind_speed,
-                causal_graph=causal_graph
+                causal_graph=causal_graph,
+                current_epoch=current_epoch
             )
 
             # 反向传播
@@ -212,7 +213,7 @@ class Trainer:
         }
     
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
+    def validate(self, current_epoch: Optional[int] = None) -> Dict[str, float]:
         """验证"""
         if self.val_loader is None:
             return {}
@@ -241,7 +242,8 @@ class Trainer:
                 outputs,
                 y,
                 wind_speed,
-                causal_graph=causal_graph
+                causal_graph=causal_graph,
+                current_epoch=current_epoch
             )
             
             total_loss += loss.item()
@@ -277,10 +279,10 @@ class Trainer:
             start_time = time.time()
             
             # 训练
-            train_metrics = self.train_epoch()
-            
+            train_metrics = self.train_epoch(current_epoch=epoch)
+
             # 验证
-            val_metrics = self.validate()
+            val_metrics = self.validate(current_epoch=epoch)
             
             # 更新学习率
             self.scheduler.step()
