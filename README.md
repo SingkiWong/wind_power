@@ -170,12 +170,16 @@ print(f"Test RMSE: {result['metrics']['rmse']:.4f}")
 ### Wind-Agent: LLM与RAG配置
 
 ```bash
-# 选择LLM后端（必须提供真实LLM，默认会拒绝TemplateLLM回显）
-export WIND_AGENT_LLM=openai
-export OPENAI_API_KEY=sk-...
-# 或使用本地Transformers模型
-# export WIND_AGENT_LLM=transformers
-# export WIND_AGENT_LLM_MODEL=Qwen/Qwen2.5-0.5B
+# 默认优先使用本地Transformers模型（不依赖外部API）
+export WIND_AGENT_LLM=transformers
+export WIND_AGENT_LLM_MODEL=/path/to/local/llm
+# 可选：指定设备/信任远程代码加载权重
+# export WIND_AGENT_LLM_DEVICE=cuda:0
+# export WIND_AGENT_TRUST_REMOTE_CODE=true
+
+# 如需调用OpenAI兼容接口，请显式设置并提供密钥
+# export WIND_AGENT_LLM=openai
+# export OPENAI_API_KEY=sk-...
 ```
 
 ```python

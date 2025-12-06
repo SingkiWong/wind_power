@@ -198,20 +198,35 @@ class TransformersLLM(LLMClient):
 
 
 def resolve_llm_from_env() -> LLMClient:
-    """Select a production-ready LLM backend using environment hints."""
+    """Select a production-ready LLM backend using environment hints.
+
+    默认优先使用本地Transformers模型，避免依赖远程API。如需调用OpenAI兼容
+    服务需显式设置 WIND_AGENT_LLM=openai 并提供 OPENAI_API_KEY。
+    """
 
     import os
 
-    provider = os.getenv("WIND_AGENT_LLM", "openai").lower()
+    provider = os.getenv("WIND_AGENT_LLM", "transformers").lower()
+    model_name = os.getenv("WIND_AGENT_LLM_MODEL", "./models/local-llm")
+
+    if provider in {"transformers", "local"}:
+        pipeline_kwargs: Dict[str, Any] = {}
+        device = os.getenv("WIND_AGENT_LLM_DEVICE")
+        if device:
+            pipeline_kwargs["device"] = device
+        trust_remote_code = os.getenv("WIND_AGENT_TRUST_REMOTE_CODE")
+        if trust_remote_code:
+            pipeline_kwargs["trust_remote_code"] = trust_remote_code.lower() == "true"
+        return TransformersLLM(model=model_name, **pipeline_kwargs)
+
     if provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
-        if api_key:
-            return OpenAIChatLLM(model=os.getenv("WIND_AGENT_LLM_MODEL", "gpt-4o-mini"), api_key=api_key)
-    if provider == "transformers":
-        return TransformersLLM(model=os.getenv("WIND_AGENT_LLM_MODEL", "Qwen/Qwen2.5-0.5B"))
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is required when WIND_AGENT_LLM=openai")
+        return OpenAIChatLLM(model=model_name, api_key=api_key, base_url=os.getenv("OPENAI_BASE_URL"))
 
     raise ValueError(
-        "No valid LLM configured. Set OPENAI_API_KEY or WIND_AGENT_LLM=transformers with a local model."
+        "No valid LLM configured. Set WIND_AGENT_LLM=transformers and WIND_AGENT_LLM_MODEL to your local checkpoint, or WIND_AGENT_LLM=openai with a valid key."
     )
 
 
