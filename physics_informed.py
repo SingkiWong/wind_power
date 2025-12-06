@@ -459,8 +459,19 @@ class PhysicsInformedTransformer(nn.Module):
         batch_size = x.shape[0]
         attention_maps = []
         
-        # 输入嵌入
-        x = self.input_embed(x) + self.pos_encoding[:, :self.input_len, :]
+        # 输入嵌入（若序列长度变化则对位置编码进行插值）
+        seq_len = x.shape[1]
+        if seq_len != self.pos_encoding.shape[1]:
+            pos = F.interpolate(
+                self.pos_encoding.transpose(1, 2),
+                size=seq_len,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+        else:
+            pos = self.pos_encoding
+
+        x = self.input_embed(x) + pos[:, :seq_len, :]
         
         # Transformer层
         norm_idx = 0
@@ -483,7 +494,10 @@ class PhysicsInformedTransformer(nn.Module):
         
         # 序列长度适配
         x = x.transpose(1, 2)  # [batch, d_model, input_len]
-        x = self.seq_adapter(x)  # [batch, d_model, output_len]
+        if x.shape[-1] == self.seq_adapter.in_features:
+            x = self.seq_adapter(x)  # [batch, d_model, output_len]
+        else:
+            x = F.interpolate(x, size=self.seq_adapter.out_features, mode="linear", align_corners=False)
         x = x.transpose(1, 2)  # [batch, output_len, d_model]
         
         # 输出

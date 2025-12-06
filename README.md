@@ -83,6 +83,7 @@
 - **WindAgent**: 完整智能体
 - **ReportGenerator**: 报告生成器
 - **Vector RAG**: 语义向量检索与动态文档摄取，替代静态关键词匹配；TemplateLLM仅在显式允许时作占位警示
+- **Context Embedding Injection**: 智能体可先检索天气/故障文本并编码为向量，在预测前送入主模型，实现神经-符号融合
 
 ### 7. CCP框架 (`ccp_framework.py`)
 - **CCPConfig**: 系统配置
@@ -94,6 +95,7 @@
 - **Dynamic Loss Weighting**: 支持静态/不确定度自适应损失平衡与课程学习分阶段开启
 - **Heteroscedastic Confidence**: 功率通道输出log-variance并用高斯NLL训练，置信度来源于方差而非随机构造
 - **Teacher-Student Distillation**: 可选TinyTimeMixer蒸馏路径，满足边缘部署时延
+- **RAG-Aware Physical Layer**: PhysicalPerceptionLayer可接收智能体提供的文本上下文向量作为额外时间步输入，和风速等物理特征一起喂给Mamba/Transformer骨干
 
 ### 8. 训练与部署 (`train_eval.py`)
 - **Curriculum Learning**: 先优化数据损失，逐步引入物理/因果约束，避免梯度冲突

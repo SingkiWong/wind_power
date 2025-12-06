@@ -419,6 +419,32 @@ class KnowledgeBase:
             for doc in docs:
                 self.vector_index.add(doc)
 
+    def encode_text(self, text: str) -> torch.Tensor:
+        """Encode arbitrary text using the active vector encoder."""
+
+        return self.vector_index.embedding_fn(text)
+
+    def embed_documents(self, docs: List[Dict]) -> Optional[torch.Tensor]:
+        """Aggregate embeddings for a list of documents (mean pooled)."""
+
+        if not docs:
+            return None
+        vectors = []
+        for doc in docs:
+            content = doc.get("content", "") + " " + doc.get("title", "")
+            vec = self.encode_text(content)
+            vectors.append(vec)
+        stacked = torch.stack(vectors)
+        mean_vec = stacked.mean(dim=0)
+        return F.normalize(mean_vec, dim=0) if mean_vec.norm() > 0 else mean_vec
+
+    def retrieve_with_embedding(self, query: str, top_k: int = 3) -> Tuple[Optional[torch.Tensor], List[Dict]]:
+        """Search and return both evidence and a pooled embedding for context injection."""
+
+        docs = self.search(query, top_k=top_k)
+        embedding = self.embed_documents(docs)
+        return embedding, docs
+
     def load_jsonl(self, path: str, namespace: str = "external"):
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -657,6 +683,30 @@ class WindAgent:
         self.session_directives: List[ChatTurn] = []
         self.conversation_max_turns = max(4, conversation_max_turns)
         self.conversation_max_chars = max(2000, conversation_max_chars)
+
+    @property
+    def context_dim(self) -> int:
+        return self.knowledge_base.vector_index.dim
+
+    def build_context_embedding_from_conditions(
+        self,
+        *,
+        wind_speed: float,
+        wind_direction: float,
+        turbine_id: Optional[str] = None,
+        note: str = "",
+        top_k: int = 3,
+    ) -> Tuple[Optional[torch.Tensor], List[Dict]]:
+        """Retrieve RAG evidence and return a pooled embedding for model fusion."""
+
+        query = (
+            f"风机{turbine_id or ''} 风速{wind_speed:.1f} 风向{wind_direction:.0f} "
+            f"特殊情况 {note}".strip()
+        )
+        embedding, docs = self.knowledge_base.retrieve_with_embedding(query, top_k=top_k)
+        if embedding is not None and embedding.dim() == 1:
+            embedding = embedding.unsqueeze(0)
+        return embedding, docs
 
     def register_session_directive(self, content: str, *, role: str = "system") -> None:
         """Register a sticky directive that is always injected into prompts.

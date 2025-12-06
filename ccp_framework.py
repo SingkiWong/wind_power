@@ -37,6 +37,7 @@ class CCPConfig:
     output_len: int = 24          # 预测长度
     num_features: int = 5         # 特征数量
     num_turbines: int = 10        # 风机数量
+    context_dim: int = 384        # 文本上下文嵌入维度（来自智能体RAG检索）
     
     # 模型配置
     d_model: int = 64             # 模型维度
@@ -91,6 +92,9 @@ class PhysicalPerceptionLayer(nn.Module):
         self.config = config
 
         self.revin = RevIN(config.num_features) if config.use_revin else None
+
+        # 文本上下文注入投影（将智能体检索到的RAG向量融合进序列）
+        self.context_proj = nn.Linear(config.context_dim, config.d_model)
         
         # 输入嵌入
         self.input_embed = nn.Linear(config.num_features, config.d_model)
@@ -171,7 +175,8 @@ class PhysicalPerceptionLayer(nn.Module):
         self,
         x: torch.Tensor,
         wind_direction: Optional[torch.Tensor] = None,
-        return_attention: bool = False
+        return_attention: bool = False,
+        context_embedding: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         前向传播
@@ -191,6 +196,12 @@ class PhysicalPerceptionLayer(nn.Module):
 
         # 输入嵌入
         x_embed = self.input_embed(x)  # [batch, input_len, d_model]
+
+        # 智能体RAG上下文注入（类似[CLS] token，放在序列首位）
+        if context_embedding is not None:
+            ctx = self.context_proj(context_embedding)  # [batch, d_model]
+            ctx = ctx.unsqueeze(1)
+            x_embed = torch.cat([ctx, x_embed], dim=1)
         
         attention_weights = None
         
@@ -502,7 +513,8 @@ class CCPSystem(nn.Module):
         self,
         x: torch.Tensor,
         wind_direction: Optional[torch.Tensor] = None,
-        return_attention: bool = False
+        return_attention: bool = False,
+        context_embeddings: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
@@ -517,7 +529,7 @@ class CCPSystem(nn.Module):
         """
         # 物理感知层
         predictions, attention, power_log_var = self.physical_layer(
-            x, wind_direction, return_attention
+            x, wind_direction, return_attention, context_embedding=context_embeddings
         )
 
         # 基于预测方差估计置信度（方差越大置信度越低）
@@ -690,9 +702,35 @@ class CCPSystem(nn.Module):
         完整的CCP流水线
         """
         self.eval()
+        device = x.device
+
+        # 0. 智能体先检索外部知识并生成上下文向量，注入到物理层
+        context_vectors: List[torch.Tensor] = []
+        rag_evidence: List[List[Dict]] = []
+        for i in range(x.shape[0]):
+            ws_val = float(wind_speed[i].mean().item()) if wind_speed.dim() > 1 else float(wind_speed[i].item())
+            wd_val = float(wind_direction[i].item() if wind_direction.dim() > 0 else wind_direction.item())
+            ctx_vec, docs = self.cognitive_layer.agent.build_context_embedding_from_conditions(
+                wind_speed=ws_val,
+                wind_direction=wd_val,
+                turbine_id=turbine_ids[i] if i < len(turbine_ids) else None,
+            )
+            rag_evidence.append(docs)
+            if ctx_vec is not None:
+                context_vectors.append(ctx_vec.squeeze(0))
+            else:
+                context_vectors.append(torch.zeros(self.config.context_dim))
+
+        context_embeddings = torch.stack(context_vectors).to(device) if context_vectors else None
+
         with torch.no_grad():
-            # 1. 物理感知层预测
-            outputs = self.forward(x, wind_direction, return_attention=True)
+            # 1. 物理感知层预测（融合了RAG上下文向量）
+            outputs = self.forward(
+                x,
+                wind_direction,
+                return_attention=True,
+                context_embeddings=context_embeddings,
+            )
             predictions = outputs['predictions']
             confidence = outputs['confidence']
             attention = outputs.get('attention')
@@ -735,7 +773,8 @@ class CCPSystem(nn.Module):
             'predictions': predictions,
             'confidence': confidence,
             'contexts': contexts,
-            'physics_consistency': physics_consistency.cpu()
+            'physics_consistency': physics_consistency.cpu(),
+            'context_evidence': rag_evidence,
         }
         
         if generate_report:
