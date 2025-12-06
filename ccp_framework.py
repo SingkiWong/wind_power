@@ -1,0 +1,596 @@
+"""
+CCP Framework: Causal-Cognitive-Physical Wind Power Prediction System
+CCP架构：因果-认知-物理 风电预测系统
+
+整合创新框架，融合：
+1. 物理感知层 - Physics-Informed Neural Networks + 物理引导注意力
+2. 因果推理层 - PCMCI + 动态尾流图谱
+3. 认知交互层 - Wind-Agent + RAG + CoT
+
+架构设计参考：
+- 第一篇文章：风电预测可解释性的多维重构
+- 第二篇文章：轻量级模型替代LLM思路（KAN、Mamba、TTM）
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Dict, List, Tuple, Optional, Any
+from datetime import datetime
+from dataclasses import dataclass
+
+# 导入自定义模块
+from kan_module import KAN, TimeKAN, PhysicsInformedKAN
+from mamba_module import WindMambaformer, SiMBA, MambaBlock
+from physics_informed import PhysicsLoss, PhysicsGuidedAttention, PhysicsInformedTransformer
+from causal_discovery import PCMCI, DynamicWakeGraph, PhysicsConstrainedCausalDiscovery
+from lightweight_models import TinyTimeMixer, PatchTSMixer, TSMixer
+from wind_agent import WindAgent, PredictionContext, ReportGenerator
+
+
+@dataclass
+class CCPConfig:
+    """CCP系统配置"""
+    # 数据配置
+    input_len: int = 96           # 输入序列长度
+    output_len: int = 24          # 预测长度
+    num_features: int = 5         # 特征数量
+    num_turbines: int = 10        # 风机数量
+    
+    # 模型配置
+    d_model: int = 64             # 模型维度
+    n_heads: int = 4              # 注意力头数
+    n_layers: int = 4             # 层数
+    dropout: float = 0.1          # Dropout率
+    
+    # 物理约束配置
+    rated_power: float = 2.0      # 额定功率 (MW)
+    cut_in_speed: float = 3.0     # 切入风速 (m/s)
+    cut_out_speed: float = 25.0   # 切出风速 (m/s)
+    
+    # 训练配置
+    lambda_physics: float = 0.1   # 物理损失权重
+    lambda_causal: float = 0.05   # 因果一致性损失权重
+    
+    # 架构选择
+    backbone: str = "mamba"       # 骨干网络: "mamba", "transformer", "ttm"
+    use_kan: bool = True          # 是否使用KAN增强
+    use_physics_attention: bool = True  # 是否使用物理引导注意力
+
+
+class PhysicalPerceptionLayer(nn.Module):
+    """
+    物理感知层
+    
+    功能：
+    1. 提取时空特征
+    2. 物理引导的注意力约束
+    3. 确保特征提取符合流体力学原理
+    
+    输出：高精度功率预测 + 物理一致的注意力权重图
+    """
+    
+    def __init__(self, config: CCPConfig):
+        super().__init__()
+        self.config = config
+        
+        # 输入嵌入
+        self.input_embed = nn.Linear(config.num_features, config.d_model)
+        
+        # 选择骨干网络
+        if config.backbone == "mamba":
+            self.backbone = WindMambaformer(
+                input_len=config.input_len,
+                output_len=config.output_len,
+                num_features=config.d_model,  # 嵌入后的维度
+                d_model=config.d_model,
+                n_layers=config.n_layers,
+                use_flow_attention=config.use_physics_attention
+            )
+        elif config.backbone == "transformer":
+            self.backbone = PhysicsInformedTransformer(
+                input_len=config.input_len,
+                output_len=config.output_len,
+                num_features=config.d_model,
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                n_layers=config.n_layers,
+                num_turbines=config.num_turbines,
+                rated_power=config.rated_power
+            )
+        else:  # ttm
+            self.backbone = TinyTimeMixer(
+                input_len=config.input_len,
+                output_len=config.output_len,
+                num_features=config.d_model,
+                d_model=config.d_model,
+                n_layers=config.n_layers
+            )
+        
+        # 物理引导注意力（可选）
+        if config.use_physics_attention and config.backbone != "transformer":
+            self.physics_attention = PhysicsGuidedAttention(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                num_turbines=config.num_turbines
+            )
+        else:
+            self.physics_attention = None
+        
+        # KAN增强层（可选）
+        if config.use_kan:
+            self.kan_head = KAN(
+                [config.d_model, 32, config.num_features],
+                num_knots=8
+            )
+        else:
+            self.kan_head = nn.Linear(config.d_model, config.num_features)
+        
+        # 物理损失计算
+        self.physics_loss = PhysicsLoss(
+            rated_power=config.rated_power,
+            cut_in_speed=config.cut_in_speed,
+            cut_out_speed=config.cut_out_speed
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        wind_direction: Optional[torch.Tensor] = None,
+        return_attention: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        前向传播
+        
+        Args:
+            x: [batch, input_len, num_features]
+            wind_direction: [batch] 风向（可选）
+            return_attention: 是否返回注意力权重
+        """
+        batch_size = x.shape[0]
+        
+        # 输入嵌入
+        x_embed = self.input_embed(x)  # [batch, input_len, d_model]
+        
+        attention_weights = None
+        
+        # 骨干网络处理
+        if self.config.backbone == "transformer" and wind_direction is not None:
+            backbone_out, attention_weights = self.backbone(
+                x_embed, wind_direction, return_attention=return_attention
+            )
+        else:
+            backbone_out, _ = self.backbone(x_embed), None
+            
+            # 物理引导注意力增强
+            if self.physics_attention is not None and wind_direction is not None:
+                attn_out, attention_weights = self.physics_attention(
+                    backbone_out, wind_direction, return_attention=return_attention
+                )
+                backbone_out = backbone_out + attn_out
+        
+        # KAN输出头
+        if isinstance(self.kan_head, KAN):
+            # KAN需要展平处理
+            b, t, d = backbone_out.shape
+            flat = backbone_out.reshape(-1, d)
+            out_flat = self.kan_head(flat)
+            output = out_flat.reshape(b, t, -1)
+        else:
+            output = self.kan_head(backbone_out)
+        
+        return output, attention_weights
+
+
+class CausalReasoningLayer(nn.Module):
+    """
+    因果推理层
+    
+    功能：
+    1. 动态构建风机因果拓扑图
+    2. 识别功率波动根因
+    3. 反事实推理支持
+    
+    输出：动态因果图谱 + 故障传播路径
+    """
+    
+    def __init__(self, config: CCPConfig):
+        super().__init__()
+        self.config = config
+        
+        # PCMCI因果发现
+        self.pcmci = PCMCI(max_lag=10, significance_level=0.05)
+        
+        # 动态尾流图
+        self.wake_graph = DynamicWakeGraph(
+            num_turbines=config.num_turbines,
+            max_lag=10
+        )
+        
+        # 因果嵌入网络（将因果图编码为向量）
+        self.causal_encoder = nn.Sequential(
+            nn.Linear(config.num_turbines * config.num_turbines, config.d_model),
+            nn.ReLU(),
+            nn.Linear(config.d_model, config.d_model)
+        )
+        
+        # 因果注意力偏置
+        self.causal_bias = nn.Parameter(
+            torch.zeros(config.num_turbines, config.num_turbines)
+        )
+    
+    def discover_causal_graph(
+        self,
+        power_data: np.ndarray,
+        wind_direction: float
+    ) -> Dict:
+        """
+        发现因果图谱
+        
+        Args:
+            power_data: [time_steps, num_turbines] 功率数据
+            wind_direction: 当前风向
+        """
+        return self.wake_graph.build_graph(power_data, wind_direction)
+    
+    def get_causal_embedding(
+        self,
+        causal_strength: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        将因果强度矩阵编码为向量
+        
+        Args:
+            causal_strength: [num_turbines, num_turbines]
+        """
+        flat = causal_strength.flatten()
+        return self.causal_encoder(flat)
+    
+    def compute_causal_consistency_loss(
+        self,
+        attention_weights: torch.Tensor,
+        causal_graph: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        计算注意力权重与因果图的一致性损失
+        
+        鼓励模型的注意力模式与发现的因果关系一致
+        """
+        if attention_weights is None:
+            return torch.tensor(0.0)
+        
+        # 平均注意力头
+        avg_attn = attention_weights.mean(dim=1)  # [batch, seq, seq]
+        
+        # 扩展因果图到batch维度
+        causal_expanded = causal_graph.unsqueeze(0).expand(avg_attn.shape[0], -1, -1)
+        
+        # 计算KL散度作为一致性度量
+        # 注意力应该在因果连接强的地方更大
+        attn_flat = avg_attn.flatten(1)
+        causal_flat = F.softmax(causal_expanded.flatten(1), dim=-1)
+        
+        consistency_loss = F.kl_div(
+            F.log_softmax(attn_flat, dim=-1),
+            causal_flat,
+            reduction='batchmean'
+        )
+        
+        return consistency_loss
+
+
+class CognitiveInterfaceLayer:
+    """
+    认知交互层
+    
+    功能：
+    1. 将数值预测转化为自然语言描述
+    2. RAG检索历史案例和技术文档
+    3. 多轮对话回应操作员质询
+    
+    输出：综合预测报告（预测曲线、置信区间、自然语言归因解释、操作建议）
+    """
+    
+    def __init__(self, config: CCPConfig):
+        self.config = config
+        self.agent = WindAgent(rated_power=config.rated_power)
+        self.reporter = ReportGenerator(self.agent)
+    
+    def create_context(
+        self,
+        turbine_id: str,
+        predicted_power: float,
+        confidence: float,
+        wind_speed: float,
+        wind_direction: float,
+        temperature: float = 15.0,
+        pressure: float = 1013.25,
+        causal_info: Optional[Dict] = None
+    ) -> PredictionContext:
+        """创建预测上下文"""
+        return PredictionContext(
+            timestamp=datetime.now(),
+            wind_speed=wind_speed,
+            wind_direction=wind_direction,
+            temperature=temperature,
+            pressure=pressure,
+            turbine_id=turbine_id,
+            predicted_power=predicted_power,
+            confidence=confidence,
+            causal_graph=causal_info
+        )
+    
+    def explain(self, context: PredictionContext) -> str:
+        """生成解释"""
+        explanation = self.agent.explain_prediction(context)
+        return explanation.summary
+    
+    def query(self, question: str, context: PredictionContext) -> str:
+        """交互式问答"""
+        return self.agent.interactive_query(question, context)
+    
+    def generate_report(
+        self,
+        contexts: List[PredictionContext],
+        report_type: str = "detailed"
+    ) -> str:
+        """生成报告"""
+        return self.reporter.generate_report(contexts, report_type)
+
+
+class CCPSystem(nn.Module):
+    """
+    CCP系统：完整的因果-认知-物理风电预测框架
+    
+    整合三层架构：
+    1. 物理感知层 - 数据驱动 + 物理约束
+    2. 因果推理层 - 拓扑发现 + 归因分析
+    3. 认知交互层 - 自然语言解释 + 智能问答
+    """
+    
+    def __init__(self, config: Optional[CCPConfig] = None):
+        super().__init__()
+        self.config = config or CCPConfig()
+        
+        # 三层架构
+        self.physical_layer = PhysicalPerceptionLayer(self.config)
+        self.causal_layer = CausalReasoningLayer(self.config)
+        self.cognitive_layer = CognitiveInterfaceLayer(self.config)
+        
+        # 置信度估计网络
+        self.confidence_net = nn.Sequential(
+            nn.Linear(self.config.d_model, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        wind_direction: Optional[torch.Tensor] = None,
+        return_attention: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        """
+        前向传播
+        
+        Args:
+            x: [batch, input_len, num_features]
+            wind_direction: [batch] 风向
+            return_attention: 是否返回注意力
+            
+        Returns:
+            outputs: 包含预测、置信度、注意力等的字典
+        """
+        # 物理感知层
+        predictions, attention = self.physical_layer(
+            x, wind_direction, return_attention
+        )
+        
+        # 估计置信度（基于输入特征的变异性）
+        x_embed = self.physical_layer.input_embed(x)
+        x_mean = x_embed.mean(dim=1)  # [batch, d_model]
+        confidence = self.confidence_net(x_mean)  # [batch, 1]
+        
+        outputs = {
+            'predictions': predictions,
+            'confidence': confidence.squeeze(-1),
+        }
+        
+        if return_attention and attention is not None:
+            outputs['attention'] = attention
+        
+        return outputs
+    
+    def compute_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: torch.Tensor,
+        wind_speed: torch.Tensor,
+        causal_graph: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        计算总损失
+        
+        L_total = L_data + λ_phy * L_physics + λ_causal * L_causal
+        """
+        predictions = outputs['predictions']
+        
+        # 1. 数据损失 (MSE)
+        data_loss = F.mse_loss(predictions, targets)
+        
+        # 2. 物理损失
+        pred_power = predictions[..., 0] if predictions.dim() > 2 else predictions
+        physics_losses = self.physical_layer.physics_loss(
+            pred_power.flatten(), wind_speed.flatten()
+        )
+        physics_loss = physics_losses['total_physics']
+        
+        # 3. 因果一致性损失
+        causal_loss = torch.tensor(0.0, device=predictions.device)
+        if causal_graph is not None and 'attention' in outputs:
+            causal_loss = self.causal_layer.compute_causal_consistency_loss(
+                outputs['attention'], causal_graph
+            )
+        
+        # 总损失
+        total_loss = (
+            data_loss + 
+            self.config.lambda_physics * physics_loss +
+            self.config.lambda_causal * causal_loss
+        )
+        
+        loss_dict = {
+            'total': total_loss.item(),
+            'data': data_loss.item(),
+            'physics': physics_loss.item(),
+            'causal': causal_loss.item() if isinstance(causal_loss, torch.Tensor) else causal_loss
+        }
+        
+        return total_loss, loss_dict
+    
+    def predict_with_explanation(
+        self,
+        x: torch.Tensor,
+        wind_speed: torch.Tensor,
+        wind_direction: torch.Tensor,
+        turbine_ids: List[str],
+        generate_report: bool = True
+    ) -> Dict[str, Any]:
+        """
+        预测并生成解释
+        
+        完整的CCP流水线
+        """
+        self.eval()
+        with torch.no_grad():
+            # 1. 物理感知层预测
+            outputs = self.forward(x, wind_direction, return_attention=True)
+            predictions = outputs['predictions']
+            confidence = outputs['confidence']
+            
+        # 2. 创建上下文
+        contexts = []
+        batch_size = x.shape[0]
+        
+        for i in range(min(batch_size, len(turbine_ids))):
+            # 取预测的最后一个时间步的功率
+            pred_power = predictions[i, -1, 0].item() if predictions.dim() > 2 else predictions[i, -1].item()
+            
+            ctx = self.cognitive_layer.create_context(
+                turbine_id=turbine_ids[i],
+                predicted_power=max(0, pred_power),  # 确保非负
+                confidence=confidence[i].item(),
+                wind_speed=wind_speed[i].mean().item(),
+                wind_direction=wind_direction[i].item() if wind_direction.dim() > 0 else wind_direction.item()
+            )
+            contexts.append(ctx)
+        
+        # 3. 生成解释和报告
+        result = {
+            'predictions': predictions,
+            'confidence': confidence,
+            'contexts': contexts
+        }
+        
+        if generate_report:
+            result['summary_report'] = self.cognitive_layer.generate_report(contexts, 'summary')
+            result['detailed_report'] = self.cognitive_layer.generate_report(contexts, 'detailed')
+        
+        return result
+
+
+def create_ccp_system(
+    backbone: str = "mamba",
+    use_kan: bool = True,
+    **kwargs
+) -> CCPSystem:
+    """
+    工厂函数：创建CCP系统
+    
+    Args:
+        backbone: 骨干网络类型 ("mamba", "transformer", "ttm")
+        use_kan: 是否使用KAN增强
+        **kwargs: 其他配置参数
+    """
+    config = CCPConfig(
+        backbone=backbone,
+        use_kan=use_kan,
+        **kwargs
+    )
+    return CCPSystem(config)
+
+
+# 测试代码
+if __name__ == "__main__":
+    print("=" * 70)
+    print("CCP Framework: Causal-Cognitive-Physical Wind Power Prediction System")
+    print("=" * 70)
+    
+    # 创建系统
+    print("\n1. Creating CCP System with Mamba backbone + KAN enhancement...")
+    system = create_ccp_system(
+        backbone="mamba",
+        use_kan=True,
+        input_len=96,
+        output_len=24,
+        num_features=5,
+        num_turbines=10
+    )
+    
+    # 统计参数
+    params = sum(p.numel() for p in system.parameters() if p.requires_grad)
+    print(f"   Total parameters: {params:,}")
+    
+    # 测试前向传播
+    print("\n2. Testing Forward Pass...")
+    batch_size = 8
+    x = torch.randn(batch_size, 96, 5)
+    wind_dir = torch.rand(batch_size) * 360
+    wind_speed = torch.rand(batch_size, 96) * 20 + 3
+    
+    outputs = system(x, wind_dir, return_attention=True)
+    print(f"   Input shape: {x.shape}")
+    print(f"   Prediction shape: {outputs['predictions'].shape}")
+    print(f"   Confidence shape: {outputs['confidence'].shape}")
+    
+    # 测试损失计算
+    print("\n3. Testing Loss Computation...")
+    targets = torch.randn(batch_size, 24, 5)
+    loss, loss_dict = system.compute_loss(outputs, targets, wind_speed)
+    print(f"   Total loss: {loss_dict['total']:.4f}")
+    print(f"   Data loss: {loss_dict['data']:.4f}")
+    print(f"   Physics loss: {loss_dict['physics']:.4f}")
+    
+    # 测试完整预测流水线
+    print("\n4. Testing Full Prediction Pipeline with Explanation...")
+    turbine_ids = [f"T{i+1}" for i in range(batch_size)]
+    
+    result = system.predict_with_explanation(
+        x[:2],  # 只取2个样本测试
+        wind_speed[:2],
+        wind_dir[:2],
+        turbine_ids[:2],
+        generate_report=True
+    )
+    
+    print("\n   Summary Report:")
+    print(result['summary_report'])
+    
+    # 测试不同骨干网络
+    print("\n5. Testing Different Backbones...")
+    for backbone in ["mamba", "ttm"]:
+        sys = create_ccp_system(backbone=backbone, use_kan=True)
+        params = sum(p.numel() for p in sys.parameters() if p.requires_grad)
+        out = sys(x, wind_dir)
+        print(f"   {backbone.upper()}: {params:,} params, output shape {out['predictions'].shape}")
+    
+    print("\n" + "=" * 70)
+    print("CCP Framework Test Complete!")
+    print("=" * 70)
+    print("\n实现的核心功能：")
+    print("  ✓ 物理感知层 - Mamba/Transformer/TTM骨干 + 物理引导注意力 + KAN增强")
+    print("  ✓ 因果推理层 - PCMCI因果发现 + 动态尾流图谱 + 因果一致性约束")
+    print("  ✓ 认知交互层 - Wind-Agent智能体 + RAG检索 + 自然语言报告生成")
+    print("  ✓ 多模态损失函数 - 数据损失 + 物理约束损失 + 因果一致性损失")
