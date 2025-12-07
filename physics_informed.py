@@ -37,19 +37,35 @@ class PhysicsLoss(nn.Module):
         rated_speed: float = 12.0,     # m/s
         rotor_diameter: float = 126.0, # m
         air_density: float = 1.225,    # kg/m³
-        betz_limit: float = 0.593      # 贝兹极限
+        betz_limit: float = 0.593,     # 贝兹极限
+        wake_decay_constant: float = 0.04,
+        residual_weight: float = 0.2,
     ):
         super().__init__()
-        self.rated_power = rated_power
-        self.cut_in_speed = cut_in_speed
-        self.cut_out_speed = cut_out_speed
-        self.rated_speed = rated_speed
-        self.rotor_diameter = rotor_diameter
-        self.air_density = air_density
-        self.betz_limit = betz_limit
-        
-        # 叶轮扫风面积
-        self.rotor_area = np.pi * (rotor_diameter / 2) ** 2
+        # 可学习的物理常数，使用softplus保证非负
+        self.raw_rated_power = nn.Parameter(torch.tensor(float(rated_power)))
+        self.raw_cut_in_speed = nn.Parameter(torch.tensor(float(cut_in_speed)))
+        self.raw_cut_out_speed = nn.Parameter(torch.tensor(float(cut_out_speed)))
+        self.raw_rated_speed = nn.Parameter(torch.tensor(float(rated_speed)))
+        self.raw_rotor_diameter = nn.Parameter(torch.tensor(float(rotor_diameter)))
+        self.raw_air_density = nn.Parameter(torch.tensor(float(air_density)))
+        self.raw_betz_limit = nn.Parameter(torch.tensor(float(betz_limit)))
+        self.raw_wake_decay = nn.Parameter(torch.tensor(float(wake_decay_constant)))
+
+        self.residual_weight = residual_weight
+
+        # priors用于防止可学习物理常数漂移过远
+        self.register_buffer('rated_power_prior', torch.tensor(float(rated_power)))
+        self.register_buffer('cut_in_prior', torch.tensor(float(cut_in_speed)))
+        self.register_buffer('cut_out_prior', torch.tensor(float(cut_out_speed)))
+        self.register_buffer('rated_speed_prior', torch.tensor(float(rated_speed)))
+        self.register_buffer('rotor_diameter_prior', torch.tensor(float(rotor_diameter)))
+        self.register_buffer('air_density_prior', torch.tensor(float(air_density)))
+        self.register_buffer('betz_prior', torch.tensor(float(betz_limit)))
+        self.register_buffer('wake_decay_prior', torch.tensor(float(wake_decay_constant)))
+
+        # 叶轮扫风面积（运行时使用正值）
+        self.register_buffer('pi_const', torch.tensor(np.pi))
     
     def betz_limit_loss(
         self,
@@ -63,17 +79,18 @@ class PhysicsLoss(nn.Module):
         P ≤ 0.5 * ρ * A * v³ * Cp_max
         """
         # 计算理论最大功率 (W -> MW)
+        rotor_area = self.physical_rotor_area(wind_speed.device)
         max_theoretical = (
-            0.5 * self.air_density * self.rotor_area * 
+            0.5 * self.air_density * rotor_area *
             (wind_speed ** 3) * self.betz_limit / 1e6
         )
-        
+
         # 限制最大理论功率不超过额定功率
         max_theoretical = torch.clamp(max_theoretical, max=self.rated_power)
         
         # 惩罚超过理论极限的预测
         violation = F.relu(predicted_power - max_theoretical)
-        return violation.mean()
+        return violation
     
     def power_curve_loss(
         self,
@@ -83,12 +100,12 @@ class PhysicsLoss(nn.Module):
         """
         功率曲线物理约束损失
         """
-        loss = torch.tensor(0.0, device=predicted_power.device)
+        loss = torch.zeros_like(predicted_power)
         
         # 区域1: 切入风速以下
         mask_below_cutin = wind_speed < self.cut_in_speed
         if mask_below_cutin.any():
-            loss = loss + (predicted_power[mask_below_cutin] ** 2).mean()
+            loss = loss + F.relu(predicted_power) * mask_below_cutin.float()
         
         # 区域2: 爬坡区 - 功率与风速立方成正比
         mask_ramp = (wind_speed >= self.cut_in_speed) & (wind_speed < self.rated_speed)
@@ -99,45 +116,130 @@ class PhysicsLoss(nn.Module):
             ) ** 3
             actual_ratio = predicted_power[mask_ramp] / self.rated_power
             deviation = (actual_ratio - expected_ratio).abs()
-            loss = loss + F.relu(deviation - 0.15).mean()
+            loss = loss + F.relu(deviation - 0.15)
         
         # 区域3: 额定区
         mask_rated = (wind_speed >= self.rated_speed) & (wind_speed < self.cut_out_speed)
         if mask_rated.any():
             deviation = (predicted_power[mask_rated] - self.rated_power).abs()
-            loss = loss + F.relu(deviation - 0.1 * self.rated_power).mean()
+            loss = loss + F.relu(deviation - 0.1 * self.rated_power)
         
         # 区域4: 切出风速以上
         mask_above_cutout = wind_speed >= self.cut_out_speed
         if mask_above_cutout.any():
-            loss = loss + (predicted_power[mask_above_cutout] ** 2).mean()
-        
+            loss = loss + (predicted_power ** 2) * mask_above_cutout.float()
+
         return loss
     
     def non_negative_loss(self, predicted_power: torch.Tensor) -> torch.Tensor:
         """非负功率约束"""
-        return F.relu(-predicted_power).mean()
+        return F.relu(-predicted_power)
     
     def rated_power_loss(self, predicted_power: torch.Tensor) -> torch.Tensor:
         """额定功率上限约束"""
-        return F.relu(predicted_power - self.rated_power).mean()
+        return F.relu(predicted_power - self.rated_power)
     
     def forward(
         self,
         predicted_power: torch.Tensor,
-        wind_speed: torch.Tensor
+        wind_speed: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         计算所有物理约束损失
+
+        Args:
+            predicted_power: 预测功率
+            wind_speed: 对应风速
+            mask: 可选的有效样本权重（用于屏蔽限电/异常值）
         """
+        physics_baseline = self.power_curve_baseline(wind_speed)
+        residual_penalty = F.smooth_l1_loss(
+            predicted_power, physics_baseline, reduction='none'
+        )
+
+        def _masked_mean(tensor: torch.Tensor) -> torch.Tensor:
+            if mask is None:
+                return tensor.mean()
+            weighted = tensor * mask
+            denom = mask.sum().clamp_min(1.0)
+            return weighted.sum() / denom
+
         losses = {
-            'betz': self.betz_limit_loss(predicted_power, wind_speed),
-            'power_curve': self.power_curve_loss(predicted_power, wind_speed),
-            'non_negative': self.non_negative_loss(predicted_power),
-            'rated_limit': self.rated_power_loss(predicted_power)
+            'betz': _masked_mean(self.betz_limit_loss(predicted_power, wind_speed)),
+            'power_curve': _masked_mean(self.power_curve_loss(predicted_power, wind_speed)),
+            'non_negative': _masked_mean(self.non_negative_loss(predicted_power)),
+            'rated_limit': _masked_mean(self.rated_power_loss(predicted_power)),
+            'residual': _masked_mean(residual_penalty) * self.residual_weight,
         }
         losses['total_physics'] = sum(losses.values())
+        losses['physics_baseline'] = physics_baseline.detach()
         return losses
+
+    @property
+    def rated_power(self) -> torch.Tensor:
+        return F.softplus(self.raw_rated_power)
+
+    @property
+    def cut_in_speed(self) -> torch.Tensor:
+        return F.softplus(self.raw_cut_in_speed)
+
+    @property
+    def cut_out_speed(self) -> torch.Tensor:
+        return F.softplus(self.raw_cut_out_speed)
+
+    @property
+    def rated_speed(self) -> torch.Tensor:
+        return F.softplus(self.raw_rated_speed)
+
+    @property
+    def rotor_diameter(self) -> torch.Tensor:
+        return F.softplus(self.raw_rotor_diameter)
+
+    @property
+    def air_density(self) -> torch.Tensor:
+        return F.softplus(self.raw_air_density)
+
+    @property
+    def betz_limit(self) -> torch.Tensor:
+        return torch.clamp(F.softplus(self.raw_betz_limit), max=0.99)
+
+    @property
+    def wake_decay_constant(self) -> torch.Tensor:
+        return F.softplus(self.raw_wake_decay)
+
+    def physical_rotor_area(self, device: torch.device) -> torch.Tensor:
+        radius = self.rotor_diameter.to(device) / 2
+        return self.pi_const.to(device) * radius ** 2
+
+    def parameter_prior_loss(self, weight: float = 1e-3) -> torch.Tensor:
+        """Penalize large drifts of learnable physics constants from their priors."""
+
+        deltas = [
+            (self.rated_power - self.rated_power_prior) ** 2,
+            (self.cut_in_speed - self.cut_in_prior) ** 2,
+            (self.cut_out_speed - self.cut_out_prior) ** 2,
+            (self.rated_speed - self.rated_speed_prior) ** 2,
+            (self.rotor_diameter - self.rotor_diameter_prior) ** 2,
+            (self.air_density - self.air_density_prior) ** 2,
+            (self.betz_limit - self.betz_prior) ** 2,
+            (self.wake_decay_constant - self.wake_decay_prior) ** 2,
+        ]
+        stacked = torch.stack([d.mean() for d in deltas])
+        return weight * stacked.mean()
+
+    def power_curve_baseline(self, wind_speed: torch.Tensor) -> torch.Tensor:
+        """使用可学习物理参数给出期望功率基线，供残差学习使用"""
+        ws = wind_speed
+        zero = torch.zeros_like(ws)
+        ramp = ((ws - self.cut_in_speed) / (self.rated_speed - self.cut_in_speed)).clamp(min=0)
+        ramp = (ramp ** 3) * self.rated_power
+        rated = torch.full_like(ws, self.rated_power)
+
+        baseline = torch.where(ws < self.cut_in_speed, zero, ramp)
+        baseline = torch.where(ws >= self.rated_speed, rated, baseline)
+        baseline = torch.where(ws >= self.cut_out_speed, zero, baseline)
+        return baseline
 
 
 class PhysicsGuidedAttention(nn.Module):
@@ -357,8 +459,19 @@ class PhysicsInformedTransformer(nn.Module):
         batch_size = x.shape[0]
         attention_maps = []
         
-        # 输入嵌入
-        x = self.input_embed(x) + self.pos_encoding[:, :self.input_len, :]
+        # 输入嵌入（若序列长度变化则对位置编码进行插值）
+        seq_len = x.shape[1]
+        if seq_len != self.pos_encoding.shape[1]:
+            pos = F.interpolate(
+                self.pos_encoding.transpose(1, 2),
+                size=seq_len,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+        else:
+            pos = self.pos_encoding
+
+        x = self.input_embed(x) + pos[:, :seq_len, :]
         
         # Transformer层
         norm_idx = 0
@@ -381,7 +494,10 @@ class PhysicsInformedTransformer(nn.Module):
         
         # 序列长度适配
         x = x.transpose(1, 2)  # [batch, d_model, input_len]
-        x = self.seq_adapter(x)  # [batch, d_model, output_len]
+        if x.shape[-1] == self.seq_adapter.in_features:
+            x = self.seq_adapter(x)  # [batch, d_model, output_len]
+        else:
+            x = F.interpolate(x, size=self.seq_adapter.out_features, mode="linear", align_corners=False)
         x = x.transpose(1, 2)  # [batch, output_len, d_model]
         
         # 输出

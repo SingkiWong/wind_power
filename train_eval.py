@@ -11,6 +11,7 @@ CCP系统训练与评估脚本
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
@@ -38,7 +39,8 @@ class WindPowerDataset(Dataset):
         data: np.ndarray,
         input_len: int = 96,
         output_len: int = 24,
-        stride: int = 1
+        stride: int = 1,
+        return_causal_graph: bool = True,
     ):
         """
         Args:
@@ -51,6 +53,7 @@ class WindPowerDataset(Dataset):
         self.input_len = input_len
         self.output_len = output_len
         self.stride = stride
+        self.return_causal_graph = return_causal_graph
         
         # 计算有效样本数
         total_len = input_len + output_len
@@ -70,12 +73,20 @@ class WindPowerDataset(Dataset):
         # 假设第一列是功率，第二列是风速，第三列是风向
         wind_speed = self.data[start:mid, 1].mean() if self.data.shape[1] > 1 else torch.tensor(10.0)
         wind_direction = self.data[mid-1, 2] if self.data.shape[1] > 2 else torch.tensor(270.0)
-        
+
+        causal_graph = None
+        if self.return_causal_graph:
+            # 简易的时间邻近因果图：对角线为1，相邻时间步呈指数衰减
+            positions = torch.arange(self.input_len)
+            dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs().float()
+            causal_graph = torch.exp(-dist / 6.0)
+
         return {
             'x': x,
             'y': y,
             'wind_speed': wind_speed,
-            'wind_direction': wind_direction
+            'wind_direction': wind_direction,
+            'causal_graph': causal_graph,
         }
 
 
@@ -130,22 +141,35 @@ class Trainer:
     """
     CCP系统训练器
     """
-    
+
     def __init__(
         self,
         model: CCPSystem,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
         lr: float = 1e-3,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        student_model: Optional[nn.Module] = None,
+        distill_weight: float = 0.3,
+        distill_temperature: float = 2.0,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
-        
+        self.student_model = student_model.to(device) if student_model is not None else None
+        self.distill_weight = distill_weight
+        self.distill_temperature = distill_temperature
+
         # 优化器
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+
+        if self.student_model is not None:
+            self.student_optimizer = optim.AdamW(
+                self.student_model.parameters(), lr=lr, weight_decay=0.01
+            )
+        else:
+            self.student_optimizer = None
         
         # 学习率调度器
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -160,7 +184,7 @@ class Trainer:
             'val_metrics': []
         }
     
-    def train_epoch(self) -> Dict[str, float]:
+    def train_epoch(self, current_epoch: Optional[int] = None) -> Dict[str, float]:
         """训练一个epoch"""
         self.model.train()
         total_loss = 0
@@ -173,23 +197,50 @@ class Trainer:
             y = batch['y'].to(self.device)
             wind_speed = batch['wind_speed'].to(self.device)
             wind_direction = batch['wind_direction'].to(self.device)
-            
+            causal_graph = batch.get('causal_graph')
+            if causal_graph is not None:
+                causal_graph = causal_graph.to(self.device)
+            if causal_graph is not None:
+                causal_graph = causal_graph.to(self.device)
+
             # 扩展wind_speed到序列长度
             if wind_speed.dim() == 1:
                 wind_speed = wind_speed.unsqueeze(1).expand(-1, y.shape[1])
-            
+
             # 前向传播
             self.optimizer.zero_grad()
-            outputs = self.model(x, wind_direction)
-            
+            outputs = self.model(
+                x,
+                wind_direction,
+                return_attention=causal_graph is not None
+            )
+
             # 计算损失
-            loss, loss_dict = self.model.compute_loss(outputs, y, wind_speed)
-            
+            loss, loss_dict = self.model.compute_loss(
+                outputs,
+                y,
+                wind_speed,
+                causal_graph=causal_graph,
+                current_epoch=current_epoch
+            )
+
             # 反向传播
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
-            
+
+            # 蒸馏轻量化学生模型，便于边缘侧部署
+            if self.student_model is not None and self.student_optimizer is not None:
+                self.student_optimizer.zero_grad()
+                with torch.no_grad():
+                    teacher_target = outputs['predictions'].detach()
+                student_pred = self.student_model(x)
+                distill_loss = F.mse_loss(student_pred, teacher_target)
+                (self.distill_weight * distill_loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.student_model.parameters(), 1.0)
+                self.student_optimizer.step()
+                loss_dict['distill'] = float(distill_loss.detach())
+
             total_loss += loss_dict['total']
             total_data_loss += loss_dict['data']
             total_physics_loss += loss_dict['physics']
@@ -202,7 +253,7 @@ class Trainer:
         }
     
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
+    def validate(self, current_epoch: Optional[int] = None) -> Dict[str, float]:
         """验证"""
         if self.val_loader is None:
             return {}
@@ -211,18 +262,29 @@ class Trainer:
         total_loss = 0
         all_preds = []
         all_targets = []
-        
+
         for batch in self.val_loader:
             x = batch['x'].to(self.device)
             y = batch['y'].to(self.device)
             wind_speed = batch['wind_speed'].to(self.device)
             wind_direction = batch['wind_direction'].to(self.device)
-            
+            causal_graph = batch.get('causal_graph')
+
             if wind_speed.dim() == 1:
                 wind_speed = wind_speed.unsqueeze(1).expand(-1, y.shape[1])
-            
-            outputs = self.model(x, wind_direction)
-            loss, _ = self.model.compute_loss(outputs, y, wind_speed)
+
+            outputs = self.model(
+                x,
+                wind_direction,
+                return_attention=causal_graph is not None
+            )
+            loss, _ = self.model.compute_loss(
+                outputs,
+                y,
+                wind_speed,
+                causal_graph=causal_graph,
+                current_epoch=current_epoch
+            )
             
             total_loss += loss.item()
             all_preds.append(outputs['predictions'].cpu())
@@ -257,10 +319,10 @@ class Trainer:
             start_time = time.time()
             
             # 训练
-            train_metrics = self.train_epoch()
-            
+            train_metrics = self.train_epoch(current_epoch=epoch)
+
             # 验证
-            val_metrics = self.validate()
+            val_metrics = self.validate(current_epoch=epoch)
             
             # 更新学习率
             self.scheduler.step()

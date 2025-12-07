@@ -1,226 +1,121 @@
-# CCP Framework: 因果-认知-物理 风电预测可解释性系统
+# CCP Framework：因果-认知-物理一体化风电预测
 
-## 项目概述
+本仓库实现了一个将 **因果发现、认知型智能体、物理约束** 与 **高效时序骨干（Mamba / Transformer / KAN / TinyTimeMixer）** 融合的风电功率预测体系。系统支持真实 LLM 与向量检索、可学习物理参数、因果一致性约束，以及将智能体检索到的上下文嵌入直接注入预测网络，实现 **神经-符号融合（Neuro-Symbolic AI）** 的端到端链路。
 
-本项目实现了一个融合**认知可解释性**、**结构可解释性**与**物理可解释性**的风电功率预测系统，基于两篇核心文章提出的创新框架：
+## 设计脉络与运行流程
+1. **数据进入物理感知层**：
+   - RevIN 对多特征（功率/风速/温度/气压等）进行可逆归一化，避免量纲差异导致梯度失衡。
+   - Input embedding / 可选上下文 token 拼接后，交给 Mamba / Transformer / KAN 骨干提取时序表示。
+   - Heteroscedastic 头输出功率均值与 log-variance，用高斯 NLL 训练并由方差反推置信度。
+2. **因果层并行运行**：
+   - Dataset 周期生成尾流因果图（PCMCI / LiNGAM），批次随数据送入模型。
+   - compute_loss 会将因果图缩放到注意力尺寸，计算因果一致性损失，与数据/物理损失动态加权求和。
+3. **认知层驱动与回灌**：
+   - Wind-Agent 使用真实 LLM + 向量检索回答问答、生成解释/报告，并在预测前构造“今日台风”等知识向量。
+   - 该上下文向量作为额外 token 注入物理层，让预测直接感知认知信息，实现神经-符号融合。
+4. **训练/评估/蒸馏闭环**：
+   - 课程学习、动态/不确定度权重平衡、可选 TinyTimeMixer 学生蒸馏，确保上线可用的轻量模型。
 
-1. **《风电预测可解释性的多维重构》** - CCP架构（因果-认知-物理）
-2. **《后LLM时代的工业级时间序列预测范式》** - 轻量级模型替代方案（KAN、Mamba、TTM）
+## 模块与关键类详解
+### `wind_agent.py` — 认知智能体与 RAG
+- **LLM 接入**：优先本地 Transformers / HuggingFace 模型，OpenAI 为显式 opt-in；TemplateLLM 默认禁用（需允许才启用）。
+- **知识检索**：优先使用 sentence-transformer 语义向量；若依赖缺失则回退到 sklearn TF-IDF 三元组，不再使用哈希取模。支持 JSONL 动态摄取和索引重建。
+- **SafetyGuardrails + 语义反思**：硬护栏执行非负/切出等数值检查；LLM 语义批注提供“软”反思，二者合并输出修正与解释。
+- **ReportGenerator / explain_prediction**：生成摘要+详情报告，并把 session directives（如“只用中文”）持续注入，避免历史裁剪丢失指令。
+- **Context Embedding**：`build_context_embedding` 返回池化向量（默认 384 维），可直接传入物理层做上下文 token。
 
-## 系统架构
+### `ccp_framework.py` — 主干框架
+- **PhysicalPerceptionLayer**：
+  - RevIN 可选；输入投影 + 可选 context token 拼接；Mamba / Transformer / KAN / 混合骨干；异方差功率头输出 μ 和 log σ。
+  - 通过 `context_embedding` 参数把智能体知识注入序列，自动调整位置编码与长度适配。
+- **Physics-aware/Confidence Pipeline**：
+  - 高斯 NLL 训练，`confidence` 由预测方差转换；支持功率通道残差输出与非负截断。
+- **CausalReasoningLayer**：缓存/更新尾流因果图，提供 `consistency_loss`，支持从 batch 读取或在线发现。
+- **CognitiveInterfaceLayer**：封装预测 + 解释 + 报告生成，直接调用 Wind-Agent 的 explain_prediction / generate_report。
+- **create_ccp_system**：统一构建入口，配置骨干、KAN 模式、RevIN、物理/因果/认知组件与上下文注入。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CCP Framework 整体架构                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐    │
-│  │  物理感知层     │  │  因果推理层     │  │  认知交互层    │    │
-│  │  Physical      │  │  Causal        │  │  Cognitive     │    │
-│  │  Perception    │  │  Reasoning     │  │  Interface     │    │
-│  └───────┬────────┘  └───────┬────────┘  └───────┬────────┘    │
-│          │                   │                   │              │
-│          ▼                   ▼                   ▼              │
-│  ┌────────────────────────────────────────────────────────┐    │
-│  │                      核心技术栈                          │    │
-│  ├────────────────────────────────────────────────────────┤    │
-│  │  • Mamba/Transformer (骨干网络)                         │    │
-│  │  • KAN (可解释非线性建模)                               │    │
-│  │  • PINNs (物理约束)                                     │    │
-│  │  • PCMCI (因果发现)                                     │    │
-│  │  • Wind-Agent (智能问答)                                │    │
-│  │  • RAG (检索增强)                                       │    │
-│  └────────────────────────────────────────────────────────┘    │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+### `physics_informed.py` — 物理损失与可学习参数
+- **可学习物理常数 + 先验正则**：额定功率、尾流衰减等以可训练参数存在，使用正则化约束偏离初值，防止“学坏”。
+- **多重物理约束**：贝兹极限、功率曲线、非负/切出/切入检查；返回 per-sample 损失以便掩码。
+- **限电影响屏蔽**：对偏离物理基线过大的样本自动掩码，避免限电/异常数据触发错误物理惩罚。
 
-## 核心模块
+### `mamba_module.py` — 时序骨干
+- **SelectiveSSM / WindMambaformer / SiMBA**：核心序列建模模块，可选混合 KAN 或纯 Mamba 路径。
+- **BiMamba 标注**：仅限编码器或补全场景，避免未来信息泄露到预测端。
+- **上下文 token 自适配**：当物理层前置上下文 token 时，自动插值/扩展位置编码与长度适配器，保持输出步长与预测 horizon 对齐。
 
-### 1. KAN模块 (`kan_module.py`)
-- **KAN**: 基础Kolmogorov-Arnold网络，使用B样条实现可学习边函数
-- **TimeKAN**: 多尺度时间序列KAN变体
-- **PhysicsInformedKAN**: 物理约束KAN（贝兹极限、功率曲线约束）
-- **符号回归**: 从学习到的函数发现数学公式
+### 其他文件
+- **`physics_informed.py`**：物理损失与掩码逻辑、物理参数先验正则。
+- **`causal_discovery.py`**：PCMCI / LiNGAM 尾流因果发现，支持定期刷新缓存。
+- **`kan_module.py`**：KAN 族组件与时间序列扩展，建议与 Mamba/Transformer 混合使用。
+- **`lightweight_models.py`**：RevIN、TinyTimeMixer 等轻量模块，可用于蒸馏或边缘部署。
+- **`train_eval.py`**：训练/验证脚本，含因果图批次接入、动态/不确定度加权、课程学习、蒸馏与评估。
 
-### 2. Mamba模块 (`mamba_module.py`)
-- **SelectiveSSM**: 选择性状态空间模型核心
-- **WindMambaformer**: 风电专用Mamba-Transformer混合架构
-- **SiMBA**: 简化Mamba架构，支持多变量
-- **BiMamba**: 双向Mamba，用于数据补全
-
-### 3. 物理信息模块 (`physics_informed.py`)
-- **PhysicsLoss**: 物理约束损失函数集合
-  - 贝兹极限约束
-  - 功率曲线约束
-  - 非负约束
-- **PhysicsGuidedAttention**: 物理引导注意力机制
-- **PhysicsInformedTransformer**: 完整的物理信息Transformer
-- **DigitalTwin**: 数字孪生虚拟感知
-
-### 4. 因果发现模块 (`causal_discovery.py`)
-- **PCMCI**: Peter-Clark Momentary Conditional Independence算法
-- **LiNGAM**: 线性非高斯无环模型
-- **DynamicWakeGraph**: 动态尾流因果图谱
-- **PhysicsConstrainedCausalDiscovery**: 物理约束因果发现
-
-### 5. 轻量化模型模块 (`lightweight_models.py`)
-- **TSMixer**: 全MLP架构
-- **TinyTimeMixer (TTM)**: IBM百万参数模型
-- **PatchTSMixer**: 抗分布偏移设计
-- **RevIN**: 可逆实例归一化
-
-### 6. Wind-Agent模块 (`wind_agent.py`)
-- **KnowledgeBase**: 风电领域知识库
-- **ReasoningChain**: 思维链推理引擎
-- **RAGEngine**: 检索增强生成引擎
-- **ReflectionAgent**: 反思智能体（预测-反思-修正闭环）
-- **WindAgent**: 完整智能体
-- **ReportGenerator**: 报告生成器
-
-### 7. CCP框架 (`ccp_framework.py`)
-- **CCPConfig**: 系统配置
-- **PhysicalPerceptionLayer**: 物理感知层
-- **CausalReasoningLayer**: 因果推理层
-- **CognitiveInterfaceLayer**: 认知交互层
-- **CCPSystem**: 完整系统
-
-## 快速开始
-
+## 使用指南
 ### 安装依赖
-
 ```bash
-pip install torch numpy scipy einops
+pip install torch numpy scipy einops scikit-learn
+# 可选：LLM / RAG
+pip install transformers sentence-transformers openai
 ```
 
-### 基础使用
-
+### 构建预测系统并注入上下文
 ```python
 from ccp_framework import create_ccp_system
-
-# 创建CCP系统
-system = create_ccp_system(
-    backbone="mamba",      # 可选: "mamba", "transformer", "ttm"
-    use_kan=True,          # 是否使用KAN增强
-    input_len=96,          # 输入序列长度
-    output_len=24,         # 预测长度
-    num_features=5         # 特征数量
-)
-
-# 预测
+from wind_agent import WindAgent
 import torch
-x = torch.randn(8, 96, 5)  # [batch, seq_len, features]
-wind_direction = torch.rand(8) * 360
 
-outputs = system(x, wind_direction)
-predictions = outputs['predictions']  # [8, 24, 5]
-confidence = outputs['confidence']    # [8]
-```
-
-### 生成解释报告
-
-```python
-# 带解释的预测
-result = system.predict_with_explanation(
-    x, wind_speed, wind_direction,
-    turbine_ids=["T1", "T2", "T3", ...],
-    generate_report=True
+system = create_ccp_system(
+    backbone="mamba", input_len=96, output_len=24, num_features=5,
+    use_kan=True, kan_mode="hybrid", use_revin=True,
 )
 
-# 查看报告
-print(result['summary_report'])
-print(result['detailed_report'])
+agent = WindAgent(conversation_max_turns=12, allow_physics_fallback=False)
+context_vec = agent.build_context_embedding(query="今日天气风险", top_k=3)
+
+x = torch.randn(4, 96, 5)
+wind_dir = torch.rand(4) * 360
+outputs = system(x, wind_dir, context_embedding=context_vec)
+pred, conf = outputs["predictions"], outputs["confidence"]
 ```
 
-### 训练模型
+### 带解释的智能体预测与报告
+```python
+from wind_agent import PredictionContext
+ctx = PredictionContext(
+    wind_speed=9.5, wind_direction=240, temperature=12.0,
+    pressure=101.2, historical_power=[0.8, 0.9, 1.0, 1.1, 1.0, 0.95],
+)
+result = agent.predict_with_explanation(ctx, system=system, context_embedding=context_vec)
+print(result["summary_report"])
+```
 
+### 训练示例
 ```python
 from train_eval import run_experiment
-
-# 运行实验
-result = run_experiment(
-    backbone="mamba",
-    use_kan=True,
-    num_epochs=50,
-    batch_size=32
+run_experiment(
+    backbone="mamba", use_kan=True, kan_mode="hybrid",
+    loss_weighting="uncertainty", curriculum_warmup=5,
+    distill_student=True, use_revin=True,
 )
-
-print(f"Test RMSE: {result['metrics']['rmse']:.4f}")
 ```
 
-## 核心创新点
+## 注意事项
+- **LLM 必须真实可用**：未配置本地模型或 OpenAI Key 时，TemplateLLM 默认抛错；可显式允许占位模式才会降级。
+- **物理参数正则**：通过 `physics_prior_strength` 调节先验约束，防止额定功率等被学偏。
+- **因果图刷新**：数据集周期生成/缓存尾流因果图，并随 batch 返回 `causal_graph` 参与因果一致性损失。
+- **上下文长度与指令保持**：对话历史有轮数/字符双重截断，可用 `register_session_directive` 固定全局指令避免被裁剪。
+- **KAN 归一化要求**：开启 RevIN 或自行确保输入在合理范围，避免 B 样条激活/梯度为零。
 
-### 1. 物理可解释性
-- 将贝兹极限、功率曲线等物理约束嵌入损失函数
-- 物理引导的注意力机制，确保模型关注正确的上游风机
-- 注意力热图与CFD模拟尾流区域的对比验证
-
-### 2. 结构可解释性
-- PCMCI算法从数据中发现真实因果关系
-- 动态尾流拓扑图谱随风向变化
-- 故障传播路径追踪
-
-### 3. 认知可解释性
-- 自然语言形式的预测解释
-- 思维链(CoT)推理过程
-- RAG检索历史案例和技术文档
-- 预测-反思-修正闭环
-
-### 4. 轻量化设计
-- KAN以1/10参数量达到MLP精度
-- Mamba实现O(L)线性复杂度
-- TTM百万参数击败数十亿大模型
-
-## 模型参数量对比
-
-| 模型配置 | 参数量 | 特点 |
-|---------|--------|------|
-| CCP-Mamba-KAN | ~500K | 推荐配置，平衡精度与效率 |
-| CCP-Transformer | ~800K | 最高精度，计算量较大 |
-| CCP-TTM | ~300K | 最轻量，适合边缘部署 |
-
-## 评估指标
-
-- **MSE**: 均方误差
-- **RMSE**: 均方根误差
-- **MAE**: 平均绝对误差
-- **MAPE**: 平均绝对百分比误差
-- **R²**: 决定系数
-- **物理一致性分数**: 预测与物理约束的符合程度
-
-## 文件结构
-
-```
-wind_power_prediction/
-├── kan_module.py           # KAN核心模块
-├── mamba_module.py         # Mamba核心模块
-├── physics_informed.py     # 物理信息模块
-├── causal_discovery.py     # 因果发现模块
-├── lightweight_models.py   # 轻量化模型
-├── wind_agent.py          # 智能体模块
-├── ccp_framework.py       # CCP主框架
-├── train_eval.py          # 训练评估脚本
-└── README.md              # 本文档
-```
-
-## 参考文献
-
-### 核心算法
-- Time-LLM (ICLR 2024)
-- Mamba: Linear-Time Sequence Modeling
-- KAN: Kolmogorov-Arnold Networks
-- PCMCI for Causal Discovery
-- Physics-Informed Neural Networks
-
-### 风电领域
-- Wind-Mambaformer
-- WindFM Foundation Model
-- Jensen Wake Model
+## 目录导航
+- `ccp_framework.py`：主框架、物理层/因果层/认知层定义
+- `mamba_module.py`：Mamba 变体与位置适配
+- `kan_module.py`：KAN 族与时间序列扩展
+- `physics_informed.py`：物理损失、可学习参数与先验正则
+- `causal_discovery.py`：PCMCI/LiNGAM 动态尾流图
+- `lightweight_models.py`：RevIN、TinyTimeMixer 等轻量模型
+- `wind_agent.py`：LLM + RAG 智能体与报告生成
+- `train_eval.py`：训练/验证脚本，含因果图与蒸馏支持
 
 ## 许可证
-
 MIT License
-
-## 作者
-
-基于文献综合实现，融合最新的LLM、因果发现、物理信息学习技术。

@@ -196,8 +196,9 @@ class MambaBlock(nn.Module):
 class BiMamba(nn.Module):
     """
     双向Mamba：同时利用过去和未来信息
-    
-    在离线训练和数据补全任务中特别有用
+
+    在离线训练和数据补全任务中特别有用；预测场景仅应在编码器侧使用，
+    避免在解码器或自回归阶段泄漏未来信息。
     """
     
     def __init__(
@@ -305,10 +306,20 @@ class WindMambaformer(nn.Module):
         batch_size = x.shape[0]
         
         # 输入嵌入
-        x = self.input_embedding(x)  # [batch, input_len, d_model]
-        
-        # 添加位置编码
-        x = x + self.pos_encoding[:, :self.input_len, :]
+        x = self.input_embedding(x)  # [batch, seq_len, d_model]
+
+        # 添加（或插值）位置编码以支持可变长度序列
+        seq_len = x.shape[1]
+        if seq_len != self.pos_encoding.shape[1]:
+            pos = F.interpolate(
+                self.pos_encoding.transpose(1, 2),
+                size=seq_len,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+        else:
+            pos = self.pos_encoding
+        x = x + pos[:, :seq_len, :]
         
         # Mamba层
         for mamba in self.mamba_layers:
@@ -320,7 +331,10 @@ class WindMambaformer(nn.Module):
         
         # 序列长度适配: [batch, input_len, d_model] -> [batch, output_len, d_model]
         x = rearrange(x, 'b l d -> b d l')
-        x = self.seq_adapter(x)
+        if x.shape[-1] == self.input_len:
+            x = self.seq_adapter(x)
+        else:
+            x = F.interpolate(x, size=self.output_len, mode="linear", align_corners=False)
         x = rearrange(x, 'b d l -> b l d')
         
         # 输出投影
@@ -447,7 +461,10 @@ class SiMBA(nn.Module):
         
         # 长度适配
         x = rearrange(x, 'b l d -> b d l')
-        x = self.len_adapter(x)
+        if x.shape[-1] == self.len_adapter.in_features:
+            x = self.len_adapter(x)
+        else:
+            x = F.interpolate(x, size=self.len_adapter.out_features, mode="linear", align_corners=False)
         x = rearrange(x, 'b d l -> b l d')
         
         # 输出
@@ -546,7 +563,12 @@ class MambaKANHybrid(nn.Module):
         
         # 长度适配
         x = rearrange(x, 'b l d -> b d l')
-        x = self.len_adapter(x)
+        if x.shape[-1] == self.len_adapter.in_features:
+            x = self.len_adapter(x)
+        else:
+            x = F.interpolate(
+                x, size=self.len_adapter.out_features, mode="linear", align_corners=False
+            )
         x = rearrange(x, 'b d l -> b l d')
         
         # KAN输出（逐时间步）
